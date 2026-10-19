@@ -1,0 +1,155 @@
+# goldnet
+
+GoldSrc/Quake-style netcode as a header-only C++17 library: an unreliable snapshot stream,
+delta-compressed against the last frame each client acked, with Quake's command uplink and
+GoldSrc's netchan riding the same packets. No engine and no dependency beyond the standard
+library. You bring the sockets and the game state, and goldnet decides what goes in each packet.
+
+Engine adapters:
+
+- [goldnet-godot](https://github.com/alanfischer/goldnet-godot): goldnet behind Godot 4's
+  `MultiplayerAPI`, serving stock `MultiplayerSynchronizer` / `MultiplayerSpawner` / `@rpc`
+
+## Why
+
+Reliable, ordered replication is simple and correct, but on a lossy link the retransmits pile up
+until the connection times out. GoldSrc takes the opposite approach. It sends an **unreliable**
+snapshot every tick, delta-compressed against the last frame the client *acked*. A lost packet is
+never resent: the next snapshot carries whatever has changed since the acked frame, so the stream
+recovers by itself. The result is steady bandwidth and connections that survive loss where
+reliable replication drops clients.
+
+## How it works
+
+**Templated on your engine.** `goldnet::Server<V, X>` and `goldnet::Client<V>` are templates over
+your value type `V` (default-constructible, copyable, comparable with `!=`) and optional
+per-entity storage `X`. They reach your engine only through a host object you pass in: read a
+slot, test visibility, encode a value, send bytes. The full list of host methods is at the top of
+`server.h` and `client.h`. goldnet never looks inside a value; it compares them, stores them and
+hands them back to you to encode.
+
+**Entities are slots.** An entity is a `net_id` and a fixed list of slots (position x, y, z, a
+yaw, a score, ...). Every tick the server reads each live entity's slots once, records which ones
+changed, and then for each peer that's due a snapshot writes only the slots that changed since
+the frame that peer last acked. An entity with nothing changed costs nothing, and a snapshot with
+nothing in it isn't sent (apart from a header-only keepalive every 250 ms, so the client's clock
+feed never goes quiet).
+
+**Spawns.** An entity both ends already know about (one that loads with the map) only needs
+`add_entity`. A runtime entity also gets `add_spawn` with your own recipe bytes, which goes to
+each peer reliable-until-acked, ahead of the entity deltas in the same packet. Despawns go only
+to peers that received the spawn, the same way.
+
+**The packet budget.** The entity section gets whatever a safe UDP payload (1200 bytes) has left,
+so a joining client's first full frame or a burst of changes can't overrun the MTU. Anything that
+doesn't fit is offered again next tick, ordered by how long it has waited for that peer times an
+optional per-entity priority, so nothing starves.
+
+**Commands, the other way.** A client's input (Quake's usercmds) is a stream where every element
+matters, so it can't converge the way state does. `CommandSender` / `CommandReceiver` deliver each
+command once and in order, the way Quake did, without a reliable channel underneath: every uplink
+packet carries the commands not sent yet, two backups, and any unacked one older than a round
+trip and a half. Each command is delta-coded bytewise against the one before it. The server's
+command ack rides each snapshot header, and the client's snapshot ack rides each uplink packet.
+
+**The netchan.** Both directions also carry a GoldSrc netchan: a reliable stream (one block in
+flight, resent only when an ack shows it lost, with large messages fragmented) and an unreliable
+datagram. Use it for events: state converges, so a value that goes A→B→A between two acked frames
+is only ever seen as A.
+
+**Rates.** Per-peer `rate` (bytes/sec, GoldSrc's choke) and `update_rate` (snapshots/sec,
+`cl_updaterate`), requested by the client over the uplink and granted by the server.
+`auto_rate.h` has meters and controllers a client can run to pick both automatically.
+
+**NetSim.** `netsim.h` simulates loss, latency, latency spikes and a slow link on any send path,
+seeded so a whole session can be replayed.
+
+The byte-level wire format is in [`docs/protocol.md`](docs/protocol.md).
+
+## Using it
+
+Add `include/` to your include path, or `add_subdirectory(goldnet)` and link the `goldnet`
+target. Tests and examples only build when goldnet is the top-level project.
+
+Server:
+
+```cpp
+goldnet::Server<MyValue> server;
+server.set_packet_overhead(28);     // IPv4 + UDP, for rate budgets
+server.set_snapshot_rate(60);       // how often you call tick()
+
+server.add_entity(key, net_id);     // starts replicating; remove_entity(key)
+server.add_spawn(net_id, record);   // a runtime entity clients must create; despawn(net_id)
+server.mark_dirty(key);             // a pushed slot was written (Entity::push)
+
+server.tick(now_ms, peers, host);   // every tick: reads state, sends each due peer a snapshot
+server.remove_peer(peer);           // on disconnect
+
+goldnet::CommandReceiver receiver;  // each uplink packet from a peer:
+receiver.receive(peer, bytes, size, host, now_ms);  // host gets acks, commands, messages, in order
+server.set_command_ack(peer, receiver.ack(peer), receiver.take_news(peer));
+server.set_uplink_ack(peer, receiver.channel_ack(peer));
+server.set_peer_rate(peer, receiver.rate(peer));
+server.set_peer_update_rate(peer, receiver.update_rate(peer));
+```
+
+Client:
+
+```cpp
+goldnet::Client<MyValue> client;
+client.apply(bytes, size, host, now_ms);  // each snapshot; client.reset() for a new session
+
+goldnet::CommandSender commands;
+commands.push(stream_id, bytes, size, now_ms);  // one command; returns its seq
+if (commands.due(now_ms)) {
+    goldnet::Writer w;
+    commands.write(now_ms, snapshot_ack, client.channel_ack(), w);  // send w to the server
+}
+// and from the client host's callbacks: commands.on_ack(seq), commands.on_channel_ack(ack, now_ms)
+```
+
+Connection management (who is a peer, timeouts, saying hello) is up to you. Both examples show a
+minimal one over plain UDP.
+
+## Examples
+
+`examples/demo_terminal.cpp` (macOS / Linux): a server bouncing balls that spawn and despawn, and
+clients that draw them in the terminal and send it a command every tick over the uplink, with
+NetSim loss and latency on either end.
+
+```bash
+cmake -S . -B build && cmake --build build
+build/examples/goldnet_demo server --loss 20 --latency 60
+build/examples/goldnet_demo client --loss 20 --latency 60   # another terminal; as many as you like
+```
+
+## Testing
+
+```bash
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+No engine, and it runs in a few seconds. The tests build with UndefinedBehaviorSanitizer and
+recovery off, and that is load-bearing: see the comment in `tests/CMakeLists.txt`.
+
+- `test_codec`: the varint codecs (including malformed over-long streams, which are reachable from
+  the wire), the angle16/angle8 quantizers (wraparound, non-finite input), the half-float codec,
+  the bounds-checked `Reader`, and the seeded loss PRNG.
+- `test_seq`: uint16 sequence comparison across rollover and the reliable-until-acked
+  bookkeeping.
+- `test_protocol`: a real `Server` feeding real `Client`s over a fake link that drops snapshots or
+  acks: deltas against the acked baseline, recovery after a lost snapshot or ack, aging into a full
+  frame, spawns, despawns scoped to holders, PVS leaves, the packet budget and its priority order,
+  per-peer cadence, pushed slots, the clock keepalive, warmup defer, and reordered, truncated or
+  mismatched packets. `TestServerHost` and `TestClientHost` there are a complete minimal host pair.
+- `test_uplink`: command delivery, order, backups, resends and give-ups.
+- `test_netchan`: the reliable block, fragments and the datagram.
+- `test_auto_rate`: the meters, and the controllers that pick a client's rate and command rate.
+- `test_netsim`: config clamping, seeded replay, the latency range and loss rate, the delay pipe,
+  the spike cycle, and the link cap.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

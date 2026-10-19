@@ -1,0 +1,2 @@
+add_executable(goldnet_demo demo_terminal.cpp)
+target_link_libraries(goldnet_demo PRIVATE goldnet)
