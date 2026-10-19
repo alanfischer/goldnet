@@ -276,8 +276,11 @@ Per tick, for each peer:
    snapshot's send to its first ack. It stops once the peer acks a snapshot that carried it: an
    ack names only the newest frame committed, so an ack of a later frame proves nothing about an
    earlier one. A spawn goes only to peers the entity is visible to (all of them, when it has no
-   visibility to ask about), and a despawn only to peers that were sent its spawn. Leaves are
-   derived from the baseline instead, so they repeat every snapshot until acked (see **Ack**).
+   visibility to ask about), and a despawn only to peers that were sent its spawn. A net_id can be
+   reused once its entity is despawned, but a peer still owed the old despawn gets the new spawn
+   only after acking a snapshot that carried that despawn: a client reads spawns before despawns,
+   so both in one snapshot would skip the spawn as one it holds and then free the entity. Leaves
+   are derived from the baseline instead, so they repeat every snapshot until acked (see **Ack**).
 4. **Entities.** An entity is a candidate when it is visible to the peer and has any slot that
    changed since the baseline. Each changed slot is written with its current value. An entity
    named by a spawn not yet proven delivered to the peer is written whole and left out of the

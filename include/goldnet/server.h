@@ -177,10 +177,10 @@ public:
 
 	// --- Spawns ---
 
-	void add_spawn(uint32_t p_net_id, SpawnRecord p_rec) {
-		spawns_[p_net_id] = std::move(p_rec);
-		despawn_pending_.erase(p_net_id); // a reused net_id is a fresh spawn, not a despawn
-	}
+	// A net_id may be reused once its entity is despawned. A peer still owed the old one's despawn
+	// gets it first, and the new spawn only once that despawn is acked: the client reads a snapshot's
+	// spawns before its despawns, so the two together would replace nothing and then free the new one.
+	void add_spawn(uint32_t p_net_id, SpawnRecord p_rec) { spawns_[p_net_id] = std::move(p_rec); }
 
 	const std::unordered_map<uint32_t, SpawnRecord> &spawns() const { return spawns_; }
 
@@ -201,8 +201,8 @@ public:
 			pr.spawn_acked.erase(p_net_id); // and forget delivery, so a reused id re-spawns cleanly
 			pr.stale_since.erase(p_net_id); // and stop tracking overflow-priority for a dead entity
 		}
-		if (!needers.empty()) {
-			despawn_pending_[p_net_id] = std::move(needers);
+		if (!needers.empty()) { // joining any peers still owed an earlier use of the id
+			despawn_pending_[p_net_id].insert(needers.begin(), needers.end());
 		}
 	}
 
@@ -610,6 +610,10 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 				if (!visible) {
 					continue; // not in this peer's PVS yet — defer the spawn
 				}
+			}
+			auto dit = despawn_pending_.find(kv.first);
+			if (dit != despawn_pending_.end() && dit->second.count(peer)) {
+				continue; // the id's last use isn't proven gone from this peer yet (add_spawn)
 			}
 			// on_ack is the sole populator of spawn_acked, the moment an ack proves a carrier arrived.
 			if (!owe_include(pr.spawn_wait, kv.first, seq, p_now, overdue, RELIABLE_BACKUP)) {

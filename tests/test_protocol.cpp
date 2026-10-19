@@ -429,8 +429,13 @@ static void test_resent_spawn_reaches_host_once() {
 	a.refuse_spawns = 0;
 	n.drop_acks.clear();
 	n.server.add_spawn(500, TestServer::SpawnRecord());
-	n.tick();
+	// The old 500's despawn was never acked, so the reuse waits for that first.
+	for (int i = 0; i < 20 && a.spawned.size() < 2; i++) {
+		n.world.ents[10].vals[0]++; // keep snapshots going
+		n.tick();
+	}
 	CHECK(a.spawned == (std::vector<uint32_t>{ 500, 500 })); // a reused id spawns again
+	CHECK(a.despawned == std::vector<uint32_t>{ 500 });      // and the new one stays
 	printf("  resent spawns and despawns reach the host once: ok\n");
 }
 
@@ -546,6 +551,67 @@ static void test_lost_despawn_is_resent() {
 	}
 	CHECK(a.despawned == std::vector<uint32_t>{ 500 });
 	printf("  a lost despawn is resent once overdue: ok\n");
+}
+
+// A net_id reused for a new entity before the old one's despawn reached a peer: the peer must
+// still drop the old entity and create the new one, not keep the old one under the new state.
+static void test_reused_id_before_the_despawn_lands() {
+	Net n;
+	Peer &a = n.add_peer(2);
+	n.add_entity(10, 100, { 1 });
+	n.server.add_spawn(500, TestServer::SpawnRecord());
+	n.tick();
+	n.tick();
+	CHECK(a.spawned == std::vector<uint32_t>{ 500 });
+	n.server.despawn(500);
+	n.drop_snapshots.insert(2);
+	n.tick(); // the despawn is lost
+	n.server.add_spawn(500, TestServer::SpawnRecord());
+	n.drop_snapshots.clear();
+	for (int i = 0; i < 20 && a.spawned.size() < 2; i++) {
+		n.world.ents[10].vals[0]++; // keep snapshots going
+		n.tick();
+	}
+	CHECK(a.despawned == std::vector<uint32_t>{ 500 });
+	CHECK(a.spawned == (std::vector<uint32_t>{ 500, 500 }));
+	CHECK(a.events == (std::vector<std::string>{ "s500", "d500", "s500" }));
+	printf("  an id reused before its despawn landed spawns again: ok\n");
+}
+
+// A reused id despawned again before an earlier despawn reached every peer: the second despawn
+// adds its holders to the first's, it doesn't replace them.
+static void test_second_despawn_keeps_the_first_owed() {
+	Net n;
+	Peer &a = n.add_peer(2);
+	Peer &b = n.add_peer(3);
+	n.add_entity(10, 100, { 1 });
+	TestServer::SpawnRecord rec;
+	rec.vis_keys = { 10 };
+	n.server.add_spawn(500, rec);
+	n.tick();
+	n.tick();
+	CHECK(a.spawned.size() == 1 && b.spawned.size() == 1);
+
+	n.server.despawn(500);
+	n.drop_snapshots.insert(2);
+	n.tick(); // b has the despawn, a doesn't
+	n.world.ents[10].visible_to = { 3 };
+	n.server.add_spawn(500, rec); // reused, and visible only to b
+	for (int i = 0; i < 20 && b.spawned.size() < 2; i++) {
+		n.world.ents[10].vals[0]++;
+		n.tick();
+	}
+	CHECK(b.spawned.size() == 2);
+	n.server.despawn(500); // owed to b now, and still to a from before
+	n.drop_snapshots.clear();
+	for (int i = 0; i < 30 && (a.despawned.empty() || b.despawned.size() < 2); i++) {
+		n.world.ents[10].vals[0]++;
+		n.tick();
+	}
+	CHECK(a.despawned == std::vector<uint32_t>{ 500 });
+	CHECK(b.despawned == (std::vector<uint32_t>{ 500, 500 }));
+	CHECK(a.spawned.size() == 1); // never saw the second use
+	printf("  a second despawn of a reused id keeps the first owed: ok\n");
 }
 
 static void test_leave_and_reentry() {
@@ -912,6 +978,8 @@ int main() {
 	test_ack_of_a_later_frame_does_not_retire_a_spawn();
 	test_entity_sent_whole_until_its_spawn_is_proven();
 	test_lost_despawn_is_resent();
+	test_reused_id_before_the_despawn_lands();
+	test_second_despawn_keeps_the_first_owed();
 	test_leave_and_reentry();
 	test_leave_lost_is_rederived();
 	test_reentry_before_leave_acked();
