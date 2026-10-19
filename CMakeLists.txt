@@ -22,8 +22,9 @@ if(GOLDNET_BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
-# The terminal demo needs only POSIX sockets.
+# The terminal demo needs only POSIX sockets. The shove demo also needs raylib and hop.
 option(GOLDNET_BUILD_EXAMPLES "Build the terminal demo" ${GOLDNET_TOP_LEVEL})
-if(GOLDNET_BUILD_EXAMPLES)
+option(GOLDNET_BUILD_SHOVE "Build the shove demo (raylib + hop)" OFF)
+if(GOLDNET_BUILD_EXAMPLES OR GOLDNET_BUILD_SHOVE)
     add_subdirectory(examples)
 endif()
