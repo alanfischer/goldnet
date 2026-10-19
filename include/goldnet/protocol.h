@@ -63,6 +63,10 @@ static const int IDLE_SNAPSHOT_BYTES = 1 + 2 + 2 + 4 + 2 + 1 + 1 + 1 + 2 + 1 + 2
 // The least update rate the server grants (GoldSrc sv_minupdaterate), snapshots/sec.
 static const uint32_t MIN_UPDATE_RATE = 10;
 
+// The least rate a client may ask for (GoldSrc sv_minrate), bytes/sec: below this a snapshot a
+// second hardly fits.
+static const uint32_t MIN_RATE = 1000;
+
 // The most of a peer's rate that idle snapshots alone may take. A grant over it would leave a slow
 // link choking on headers, served unevenly instead of at a lower, steady rate.
 static const double UPDATE_RATE_RATE_SHARE = 0.3;

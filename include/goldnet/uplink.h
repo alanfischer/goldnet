@@ -42,7 +42,8 @@
 //             uvarint len, then ceil(len / 8) mask bytes (bit i: byte i differs from the base),
 //             then the differing bytes
 //
-// The host passed to CommandReceiver::receive() provides:
+// A server normally takes each packet with Server::receive_uplink, which calls receive() and does
+// the snapshot_ack and channel_ack parts itself. The host passed to receive() directly provides:
 //   void protocol_mismatch(int32_t peer)            a different build is talking to us (once per peer)
 //   void snapshot_ack(int32_t peer, uint16_t seq)   pass to Server::on_ack
 //   void channel_ack(int32_t peer, const ChannelAck &ack)   pass to Server::on_channel_ack

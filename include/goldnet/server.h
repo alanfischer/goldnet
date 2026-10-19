@@ -42,6 +42,13 @@
 // spawn(), and one that has it but can't take values yet sets begin_entity's r_defer; either way
 // the client withholds the ack and the server keeps offering it (Client::apply has the details).
 //
+// The uplink. receive_uplink() takes each packet a peer sends: the CommandReceiver delivers its
+// commands and messages to the host, and the server takes the rest, the acks and what the client
+// asks for. The host passed to it provides:
+//   void protocol_mismatch(int32_t peer)            a different build is talking to us (once per peer)
+//   void command(int32_t peer, uint32_t stream_id, const uint8_t *data, size_t size)
+//   void message(int32_t peer, const uint8_t *data, size_t size, bool reliable)
+//
 // Messages. Each peer's snapshots carry its end of a GoldSrc netchan (netchan.h): queue_reliable and
 // queue_unreliable put the host's messages in the peer's next snapshots, ahead of the entities in the
 // packet budget. The client's half of the acks arrives in its uplink (on_channel_ack), and what the
@@ -51,6 +58,7 @@
 #include "goldnet/codec.h"
 #include "goldnet/netchan.h"
 #include "goldnet/protocol.h"
+#include "goldnet/uplink.h"
 
 #include <algorithm>
 #include <cmath>
@@ -177,10 +185,10 @@ public:
 
 	// --- Spawns ---
 
-	void add_spawn(uint32_t p_net_id, SpawnRecord p_rec) {
-		spawns_[p_net_id] = std::move(p_rec);
-		despawn_pending_.erase(p_net_id); // a reused net_id is a fresh spawn, not a despawn
-	}
+	// A net_id may be reused once its entity is despawned. A peer still owed the old one's despawn
+	// gets it first, and the new spawn only once that despawn is acked: the client reads a snapshot's
+	// spawns before its despawns, so the two together would replace nothing and then free the new one.
+	void add_spawn(uint32_t p_net_id, SpawnRecord p_rec) { spawns_[p_net_id] = std::move(p_rec); }
 
 	const std::unordered_map<uint32_t, SpawnRecord> &spawns() const { return spawns_; }
 
@@ -201,8 +209,8 @@ public:
 			pr.spawn_acked.erase(p_net_id); // and forget delivery, so a reused id re-spawns cleanly
 			pr.stale_since.erase(p_net_id); // and stop tracking overflow-priority for a dead entity
 		}
-		if (!needers.empty()) {
-			despawn_pending_[p_net_id] = std::move(needers);
+		if (!needers.empty()) { // joining any peers still owed an earlier use of the id
+			despawn_pending_[p_net_id].insert(needers.begin(), needers.end());
 		}
 	}
 
@@ -264,6 +272,16 @@ public:
 		pr.uplink_lag_ms = p_lag_ms;
 		pr.uplink_pps = p_pps;
 	}
+
+	// --- The uplink (uplink.h) ---
+
+	// One uplink packet from p_peer, through p_receiver: its commands and messages go to p_host, its
+	// snapshot and channel acks to this server, and the peer's next header gets the command ack, the
+	// uplink ack and the uplink report. The rate it asks for (at least MIN_RATE) and its update rate
+	// apply from here on. False if the packet was malformed or from a mismatched build.
+	template <class Host>
+	bool receive_uplink(int32_t p_peer, CommandReceiver &p_receiver, const uint8_t *p_data, size_t p_size,
+			Host &p_host, uint32_t p_now);
 
 	// --- Messages (netchan.h) ---
 
@@ -495,6 +513,31 @@ private:
 
 template <class V, class X>
 template <class Host>
+bool Server<V, X>::receive_uplink(int32_t p_peer, CommandReceiver &p_receiver, const uint8_t *p_data,
+		size_t p_size, Host &p_host, uint32_t p_now) {
+	struct Router {
+		Server &server;
+		Host &host;
+		uint32_t now;
+		void protocol_mismatch(int32_t p) { host.protocol_mismatch(p); }
+		void snapshot_ack(int32_t p, uint16_t seq) { server.on_ack(p, seq, now); }
+		void channel_ack(int32_t p, const ChannelAck &a) { server.on_channel_ack(p, a); }
+		void command(int32_t p, uint32_t stream, const uint8_t *d, size_t n) { host.command(p, stream, d, n); }
+		void message(int32_t p, const uint8_t *d, size_t n, bool reliable) { host.message(p, d, n, reliable); }
+	};
+	Router router{ *this, p_host, p_now };
+	const bool ok = p_receiver.receive(p_peer, p_data, p_size, router, p_now);
+	set_command_ack(p_peer, p_receiver.ack(p_peer), p_receiver.take_news(p_peer));
+	set_uplink_ack(p_peer, p_receiver.channel_ack(p_peer));
+	set_uplink_report(p_peer, p_receiver.uplink_lag_ms(p_peer), p_receiver.uplink_pps(p_peer));
+	const uint32_t rate = p_receiver.rate(p_peer);
+	set_peer_rate(p_peer, rate > 0 && rate < MIN_RATE ? MIN_RATE : rate);
+	set_peer_update_rate(p_peer, p_receiver.update_rate(p_peer));
+	return ok;
+}
+
+template <class V, class X>
+template <class Host>
 void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Host &p_host) {
 	// Resolve which peers are due BEFORE the per-entity state read below: on a tick where every
 	// peer is throttled (all of them on a slower cadence than the server's) this costs nothing.
@@ -610,6 +653,10 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 				if (!visible) {
 					continue; // not in this peer's PVS yet — defer the spawn
 				}
+			}
+			auto dit = despawn_pending_.find(kv.first);
+			if (dit != despawn_pending_.end() && dit->second.count(peer)) {
+				continue; // the id's last use isn't proven gone from this peer yet (add_spawn)
 			}
 			// on_ack is the sole populator of spawn_acked, the moment an ack proves a carrier arrived.
 			if (!owe_include(pr.spawn_wait, kv.first, seq, p_now, overdue, RELIABLE_BACKUP)) {
