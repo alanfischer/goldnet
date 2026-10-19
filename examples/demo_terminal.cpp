@@ -3,11 +3,12 @@
 // also sends the server a command every 16 ms over the uplink, the way Quake sends usercmds, and
 // the server reports whether every one arrived in order.
 //
-//   build/examples/goldnet_demo server [--port 27500] [--loss PCT] [--latency MS] [--rate BYTES_PER_SEC]
+//   build/examples/goldnet_demo server [--port 27500] [--loss PCT] [--latency MS]
 //   build/examples/goldnet_demo client [--host 127.0.0.1] [--port 27500] [--loss PCT] [--latency MS]
+//                                      [--rate BYTES_PER_SEC]
 //
 // --loss and --latency apply to whichever end they're given to: the server's snapshots, or the
-// client's uplink. Client -> server datagrams are 'H' (hello: start a session) or 'U' + an uplink
+// client's uplink. --rate is the rate the client asks the server for (GoldSrc `rate`). Client -> server datagrams are 'H' (hello: start a session) or 'U' + an uplink
 // packet (snapshot ack and commands). Server -> client datagrams are goldnet snapshots, unframed.
 
 #include "goldnet/client.h"
@@ -152,7 +153,6 @@ struct ServerApp {
 	int64_t total_bounces = 0;
 	uint32_t next_net_id = 100;
 	char next_letter = 'A';
-	uint32_t rate = 0;
 
 	struct PeerInfo {
 		sockaddr_in addr;
@@ -211,10 +211,8 @@ struct ServerApp {
 		}
 	}
 
-	// The host interface CommandReceiver::receive() calls back into.
+	// The host interface Server::receive_uplink() calls back into.
 	void protocol_mismatch(int32_t peer) { fprintf(stderr, "[server] peer %d speaks a different version\n", peer); }
-	void snapshot_ack(int32_t peer, uint16_t seq) { server.on_ack(peer, seq, now_ms()); }
-	void channel_ack(int32_t peer, const ChannelAck &ack) { server.on_channel_ack(peer, ack); }
 	void message(int32_t, const uint8_t *, size_t, bool) {}
 	void command(int32_t peer, uint32_t, const uint8_t *data, size_t size) {
 		PeerInfo &p = peers[peer];
@@ -289,15 +287,10 @@ struct ServerApp {
 				const int32_t id = next_peer++;
 				peers[id] = PeerInfo{ from, now };
 				by_addr[key] = id;
-				if (rate) {
-					server.set_peer_rate(id, rate);
-				}
 				printf("[server] peer %d joined from %s\n", id, key.c_str());
 			} else if (buf[0] == 'U' && it != by_addr.end()) {
 				peers[it->second].last_heard = now;
-				commands.receive(it->second, buf + 1, (size_t)n - 1, *this, now_ms());
-				server.set_command_ack(it->second, commands.ack(it->second), commands.take_news(it->second));
-				server.set_uplink_ack(it->second, commands.channel_ack(it->second));
+				server.receive_uplink(it->second, commands, buf + 1, (size_t)n - 1, *this, now_ms());
 			}
 			len = sizeof(from);
 		}
@@ -316,8 +309,8 @@ struct ServerApp {
 		fd = open_socket(port);
 		server.set_packet_overhead(28); // IPv4 + UDP headers
 		server.add_entity(SCOREBOARD_ID, SCOREBOARD_ID);
-		printf("[server] listening on udp %d (loss %d%%, latency %d ms, rate %u B/s)\n", port,
-				sim.loss_percent(), sim.latency_max_ms(), rate);
+		printf("[server] listening on udp %d (loss %d%%, latency %d ms)\n", port, sim.loss_percent(),
+				sim.latency_max_ms());
 
 		uint32_t next_tick = now_ms();
 		uint32_t next_spawn = next_tick;
@@ -356,8 +349,8 @@ struct ServerApp {
 				for (auto &kv : peers) {
 					printf("[server]   peer %d: %u commands/s, %u out of order, %u given up on", kv.first,
 							kv.second.commands, kv.second.out_of_order, commands.skipped(kv.first));
-					if (rate) {
-						printf(", choked %u times", server.chokes(kv.first));
+					if (server.peer_rate(kv.first)) {
+						printf(", rate %u B/s, choked %u times", server.peer_rate(kv.first), server.chokes(kv.first));
 					}
 					printf("\n");
 					kv.second.commands = 0;
@@ -381,6 +374,7 @@ struct ClientApp {
 	NetSim<std::vector<uint8_t>> sim; // on the uplink
 	uint16_t snapshot_ack = 0;
 	uint32_t next_command = 0;
+	uint32_t rate = 0; // asked of the server; 0 = no limit
 
 	struct Ent {
 		char letter;
@@ -455,6 +449,7 @@ struct ClientApp {
 	void new_session() {
 		client.reset();
 		commands.reset();
+		commands.set_rate(rate);
 		snapshot_ack = 0;
 		next_command = 0;
 		ents.clear();
@@ -578,8 +573,8 @@ struct ClientApp {
 
 static void usage() {
 	fprintf(stderr,
-			"usage: goldnet_demo server [--port N] [--loss PCT] [--latency MS] [--rate BYTES_PER_SEC]\n"
-			"       goldnet_demo client [--host H] [--port N] [--loss PCT] [--latency MS]\n");
+			"usage: goldnet_demo server [--port N] [--loss PCT] [--latency MS]\n"
+			"       goldnet_demo client [--host H] [--port N] [--loss PCT] [--latency MS] [--rate BYTES_PER_SEC]\n");
 	exit(2);
 }
 
@@ -612,7 +607,7 @@ int main(int argc, char **argv) {
 			cl.sim.set_latency_min_ms(atoi(v));
 			cl.sim.set_latency_max_ms(atoi(v));
 		} else if (a == "--rate") {
-			srv.rate = (uint32_t)atoi(v);
+			cl.rate = (uint32_t)atoi(v);
 		} else {
 			usage();
 		}

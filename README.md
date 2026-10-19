@@ -86,11 +86,8 @@ server.tick(now_ms, peers, host);   // every tick: reads state, sends each due p
 server.remove_peer(peer);           // on disconnect
 
 goldnet::CommandReceiver receiver;  // each uplink packet from a peer:
-receiver.receive(peer, bytes, size, host, now_ms);  // host gets acks, commands, messages, in order
-server.set_command_ack(peer, receiver.ack(peer), receiver.take_news(peer));
-server.set_uplink_ack(peer, receiver.channel_ack(peer));
-server.set_peer_rate(peer, receiver.rate(peer));
-server.set_peer_update_rate(peer, receiver.update_rate(peer));
+server.receive_uplink(peer, receiver, bytes, size, host, now_ms);
+// host gets command() and message() in order; the server takes the acks, rate and update rate
 ```
 
 Client:

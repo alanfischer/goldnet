@@ -864,6 +864,56 @@ static void test_command_ack_rides_the_header() {
 	printf("  the command ack rides the header and earns a send when new: ok\n");
 }
 
+struct TestUplinkHost {
+	std::vector<std::vector<uint8_t>> commands;
+	void protocol_mismatch(int32_t) {}
+	void command(int32_t, uint32_t, const uint8_t *data, size_t size) {
+		commands.push_back(std::vector<uint8_t>(data, data + size));
+	}
+	void message(int32_t, const uint8_t *, size_t, bool) {}
+};
+
+// receive_uplink takes a whole uplink packet: the commands go to the host, and the server takes the
+// snapshot ack, the command ack for the next header, and the rate and update rate the client asks for.
+static void test_receive_uplink_takes_the_whole_packet() {
+	Net n;
+	Peer &p = n.add_peer(2);
+	n.add_entity(10, 100, { 0 });
+	n.server.set_snapshot_rate(60.0);
+	n.drop_acks.insert(2); // only the uplink acks
+	n.tick();
+	CHECK(base_seq_of(n.last_packet(2)) == 0);
+
+	CommandSender sender;
+	CommandReceiver receiver;
+	TestUplinkHost host;
+	sender.set_rate(20000);
+	sender.set_update_rate(20);
+	const uint8_t cmd[3] = { 1, 2, 3 };
+	const uint16_t seq = sender.push(1, cmd, sizeof(cmd), n.now);
+	Writer w;
+	sender.write(n.now, p.acks.back(), p.client.channel_ack(), w);
+	CHECK(n.server.receive_uplink(2, receiver, w.data(), w.size(), host, n.now));
+	CHECK(host.commands == std::vector<std::vector<uint8_t>>{ std::vector<uint8_t>(cmd, cmd + 3) });
+	CHECK(n.server.peer_rate(2) == 20000);
+
+	n.world.ents[10].vals[0] = 1;
+	for (int i = 0; i < 4 && (i == 0 || n.sent_to(2) == 0); i++) {
+		n.tick(); // every third tick at 20 of 60 Hz
+	}
+	CHECK(n.sent_to(2) == 1);
+	CHECK(base_seq_of(n.last_packet(2)) == p.acks.front()); // the uplink's snapshot ack landed
+	CHECK(p.command_acks.back() == seq);
+	CHECK(n.server.update_rate(2) == 20 && p.update_rates.back() == 20);
+
+	sender.set_rate(200); // under the floor
+	Writer w2;
+	sender.write(n.now, p.acks.back(), p.client.channel_ack(), w2);
+	n.server.receive_uplink(2, receiver, w2.data(), w2.size(), host, n.now);
+	CHECK(n.server.peer_rate(2) == MIN_RATE);
+	printf("  receive_uplink takes the commands, the acks and the rates: ok\n");
+}
+
 // The server's measure of a client's uplink rides the header of that client's snapshots.
 static void test_uplink_report_rides_the_header() {
 	Net n;
@@ -973,6 +1023,7 @@ int main() {
 	test_spawn_is_lazy_and_reliable();
 	test_resent_spawn_reaches_host_once();
 	test_command_ack_rides_the_header();
+	test_receive_uplink_takes_the_whole_packet();
 	test_refused_spawn_holds_ack();
 	test_unacked_spawn_resends_only_when_overdue();
 	test_ack_of_a_later_frame_does_not_retire_a_spawn();
