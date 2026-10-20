@@ -161,7 +161,6 @@ struct ServerApp {
 		uint32_t out_of_order = 0; // ever: should stay 0
 		uint32_t expect = 0;
 	};
-	CommandReceiver commands;
 	std::map<int32_t, PeerInfo> peers;
 	std::map<std::string, int32_t> by_addr;
 	int32_t next_peer = 1;
@@ -290,7 +289,7 @@ struct ServerApp {
 				printf("[server] peer %d joined from %s\n", id, key.c_str());
 			} else if (buf[0] == 'U' && it != by_addr.end()) {
 				peers[it->second].last_heard = now;
-				server.receive_uplink(it->second, commands, buf + 1, (size_t)n - 1, *this, now_ms());
+				server.receive_uplink(it->second, buf + 1, (size_t)n - 1, *this, now_ms());
 			}
 			len = sizeof(from);
 		}
@@ -301,7 +300,6 @@ struct ServerApp {
 		by_addr.erase(addr_key(peers[id].addr));
 		peers.erase(id);
 		server.remove_peer(id);
-		commands.remove_peer(id);
 		sim.forget_link(id);
 	}
 
@@ -348,7 +346,7 @@ struct ServerApp {
 						balls.size(), packets_out, bytes_out / 1024.0);
 				for (auto &kv : peers) {
 					printf("[server]   peer %d: %u commands/s, %u out of order, %u given up on", kv.first,
-							kv.second.commands, kv.second.out_of_order, commands.skipped(kv.first));
+							kv.second.commands, kv.second.out_of_order, server.skipped_commands(kv.first));
 					if (server.peer_rate(kv.first)) {
 						printf(", rate %u B/s, choked %u times", server.peer_rate(kv.first), server.chokes(kv.first));
 					}
@@ -370,9 +368,7 @@ struct ClientApp {
 	int fd = -1;
 	sockaddr_in server_addr = {};
 	Client<Value> client;
-	CommandSender commands;
 	NetSim<std::vector<uint8_t>> sim; // on the uplink
-	uint16_t snapshot_ack = 0;
 	uint32_t next_command = 0;
 	uint32_t rate = 0; // asked of the server; 0 = no limit
 
@@ -389,12 +385,7 @@ struct ClientApp {
 	// The host interface Client::apply() calls back into.
 	void protocol_mismatch() { fprintf(stderr, "[client] server speaks a different snapshot version\n"); }
 	void server_time(uint32_t ms) { server_ms = ms; }
-	void command_ack(uint16_t seq) { commands.on_ack(seq); }
-	void uplink_report(uint32_t, uint32_t) {}
-	void update_rate(uint32_t) {}
-	void channel_ack(const ChannelAck &ack) { commands.on_channel_ack(ack, now_ms()); }
 	void message(const uint8_t *, size_t, bool) {}
-	void send_ack(uint16_t seq) { snapshot_ack = seq; } // rides the next uplink packet
 	bool spawn(uint32_t net_id, uint32_t, const uint8_t *data, size_t size) {
 		ents[net_id] = Ent{ size ? (char)data[0] : '?', std::vector<Value>(BALL_SLOTS) };
 		spawns++;
@@ -427,13 +418,13 @@ struct ClientApp {
 	void make_command(uint32_t now) {
 		const uint32_t n = next_command++;
 		const uint8_t cmd[8] = { (uint8_t)n, (uint8_t)(n >> 8), (uint8_t)(n >> 16), (uint8_t)(n >> 24), 1, 2, 3, 4 };
-		commands.push(CMD_STREAM, cmd, sizeof(cmd), now);
-		if (!commands.due(now)) {
+		client.uplink().push(CMD_STREAM, cmd, sizeof(cmd), now);
+		if (!client.uplink_due(now)) {
 			return;
 		}
 		Writer w;
 		w.put_u8('U');
-		commands.write(now, snapshot_ack, client.channel_ack(), w);
+		client.write_uplink(now, w);
 		if (sim.loss_roll()) {
 			return;
 		}
@@ -448,9 +439,7 @@ struct ClientApp {
 
 	void new_session() {
 		client.reset();
-		commands.reset();
-		commands.set_rate(rate);
-		snapshot_ack = 0;
+		client.set_rate(rate);
 		next_command = 0;
 		ents.clear();
 		ents[SCOREBOARD_ID] = Ent{ '#', std::vector<Value>(2) };
@@ -472,8 +461,8 @@ struct ClientApp {
 		}
 		const Ent &score = ents[SCOREBOARD_ID];
 		char cmds[96];
-		snprintf(cmds, sizeof(cmds), "%u commands sent, %zu unacked, rtt %u ms", next_command, commands.pending(),
-				commands.rtt_ms());
+		snprintf(cmds, sizeof(cmds), "%u commands sent, %zu unacked, rtt %u ms", next_command, client.uplink().pending(),
+				client.uplink().rtt_ms());
 		if (!tty) {
 			printf("[client] t=%.1fs %d snapshots (%d committed), %.1f KB/s, %d spawns, %d despawns, "
 				   "%lld balls, %lld bounces; %s\n",

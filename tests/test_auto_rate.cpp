@@ -131,7 +131,7 @@ static void test_rate_cuts_while_queueing_down_to_the_floor() {
 	const int first = feed_rate(c, 6000, 1000, 300.0, 6000.0);
 	CHECK(feed_rate(c, 7000, 1000, 300.0, 6000.0) == first); // held while the queue drains
 	CHECK(feed_rate(c, 8000, 2000, 300.0, 6000.0) < first);
-	CHECK(feed_rate(c, 10000, 60000, 300.0, 6000.0) == RateAuto::MIN_RATE);
+	CHECK(feed_rate(c, 10000, 60000, 300.0, 6000.0) == MIN_RATE);
 	printf("  cuts while it queues, never under the floor: ok\n");
 }
 
@@ -182,8 +182,8 @@ static bool near(double a, double b) { return std::fabs(a - b) < 0.01; }
 
 static void test_cmd_starts_low_and_climbs_quickly() {
 	CmdRateAuto c;
-	CHECK(c.note(1000, 0.0, 0.0, CEILING) == CmdRateAuto::START_RATE);
-	const int steps = (int)((CEILING - CmdRateAuto::START_RATE) / CmdRateAuto::STEP);
+	CHECK(c.note(1000, 0.0, 0.0, CEILING) == CmdRateAuto::START_HZ);
+	const int steps = (int)((CEILING - CmdRateAuto::START_HZ) / CmdRateAuto::STEP);
 	CHECK(feed_cmd(c, 1000, (steps + 1) * CmdRateAuto::SLOW_START_MS + 100, 5.0) == CEILING);
 	CHECK(feed_cmd(c, 20000, 20000, 5.0) == CEILING);
 	printf("  starts low, climbs quickly to the ceiling and stays: ok\n");
@@ -202,7 +202,7 @@ static void test_cmd_sustained_queueing_cuts_and_holds() {
 	CHECK(r < CEILING && r >= CEILING * CmdRateAuto::CUT - 0.01);
 	r = feed_cmd(c, 12000, 1000, 300.0); // the cut came ~50 ms in; its hold runs to ~13050
 	CHECK(r >= CEILING * CmdRateAuto::CUT - 0.01);
-	CHECK(feed_cmd(c, 13000, 20000, 300.0) == CmdRateAuto::MIN_RATE);
+	CHECK(feed_cmd(c, 13000, 20000, 300.0) == CmdRateAuto::MIN_HZ);
 	printf("  sustained queueing cuts, holds, and stops at the floor: ok\n");
 }
 

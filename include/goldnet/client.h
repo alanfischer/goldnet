@@ -4,17 +4,22 @@
 // server diffed it against, apply spawns / despawns / leaves / changed slots through the host, and
 // ack. Engine-agnostic, like Server.
 //
+// The uplink. Everything the client sends rides its uplink packets: its commands and messages
+// (uplink(), see uplink.h), the snapshot ack, what it has of the server's channel, and the rate and
+// update rate it asks for (set_rate, set_update_rate). Send one whenever uplink_due() says so:
+//
+//   if (client.uplink_due(now)) { Writer w; client.write_uplink(now, w); /* send w */ }
+//
+// A fresh ack makes a packet due on its own, unless commands are flowing: then it rides the next
+// command packet, which comes within the command interval (set_command_rate).
+//
+// The rate and the command rate can each be picked automatically instead (auto_rate.h): the rate
+// from how far behind the downlink arrives, the command rate from the server's report of the uplink.
+//
 // The host passed to apply() provides:
 //   void protocol_mismatch()                       a different build is talking to us (once per session)
-//   void server_time(uint32_t ms)                  every in-order snapshot's header clock
-//   void command_ack(uint16_t seq)                 and its command ack (CommandSender::on_ack); 0 = none
-//   void uplink_report(uint32_t lag_ms, uint32_t pps)   and the server's measure of our uplink
-//                                                  (CmdRateAuto)
-//   void update_rate(uint32_t hz)                  and the snapshots/sec the server grants us; 0 =
-//                                                  every tick, at a rate it doesn't know
-//   void channel_ack(const ChannelAck &ack)       and what the server has of our uplink's channel
-//                                                  (CommandSender::on_channel_ack)
-//   void send_ack(uint16_t seq)                    the snapshot ack for the next uplink packet
+//   void server_time(uint32_t ms)                  every in-order snapshot's header clock, before
+//                                                  any of its values are applied
 //   void message(const uint8_t *data, size_t size, bool reliable)   one netchan message (netchan.h)
 //   bool spawn(uint32_t net_id, uint32_t spawner_net_id, const uint8_t *data, size_t size)
 //        create it; false = can't yet: the frame isn't acked, so the spawn is offered again
@@ -32,11 +37,14 @@
 // despawns, so an event can name an entity the same snapshot creates or removes. QuakeWorld ran its
 // datagram after the entities; it held only temp entities, which need no entity to land on.
 //
+#include "goldnet/auto_rate.h"
 #include "goldnet/buffer.h"
 #include "goldnet/codec.h"
 #include "goldnet/netchan.h"
 #include "goldnet/protocol.h"
+#include "goldnet/uplink.h"
 
+#include <cmath>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -54,6 +62,8 @@ public:
 		int despawns = 0;
 		int changed = 0;
 		bool committed = false;
+		uint16_t ack = 0;         // the snapshot ack it queued for the uplink; 0 = none
+		uint16_t command_ack = 0; // the header's: the newest command the server has; 0 = none
 	};
 
 	// Snapshots that arrived, and seqs skipped on the way to them, this session. The server
@@ -78,14 +88,91 @@ public:
 		has_ = false;
 		defer_streak_ = 0;
 		chan_ = ChannelReceiver();
+		uplink_.reset();
+		ack_ = 0;
+		news_ = false;
+		received_bytes_ = 0;
+		downlink_ = DownlinkMeter();
+		cmd_auto_ = CmdRateAuto();
+		uplink_lag_ms_ = 0;
+		uplink_pps_ = 0;
+		update_rate_granted_ = -1;
+		apply_link();
 	}
 
-	// For the uplink: what this end has received of the server's channel.
-	const ChannelAckSource &channel_ack() const { return chan_.ack_source(); }
-
-	// p_now: the host's clock, the same one it writes its uplink packets by (see channel_ack).
+	// p_now: the host's clock, the same one it writes its uplink packets by.
 	template <class Host>
 	ApplyInfo apply(const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now);
+
+	// The commands and messages this client sends (uplink.h). Its rate, update rate and interval are
+	// set from the ones below.
+	CommandSender &uplink() { return uplink_; }
+	const CommandSender &uplink() const { return uplink_; }
+
+	// --- The link (GoldSrc rate, cl_updaterate, cl_cmdrate). Settings outlive reset(). ---
+
+	// The bytes/sec the server may send us; 0 = no limit. While auto_rate is on, picked from how far
+	// behind the downlink arrives instead (RateAuto).
+	void set_rate(uint32_t p_bps) {
+		rate_ = p_bps;
+		apply_link();
+	}
+	uint32_t rate() const { return rate_; }
+	void set_auto_rate(bool p_on) {
+		auto_rate_ = p_on;
+		apply_link();
+	}
+	bool auto_rate() const { return auto_rate_; }
+
+	// The snapshots/sec we ask for; 0 = as many as the server sends.
+	void set_update_rate(uint32_t p_hz) {
+		update_rate_ = p_hz;
+		apply_link();
+	}
+	uint32_t update_rate() const { return update_rate_; }
+	// What the server granted, from its last header; -1 = no word yet this session.
+	int update_rate_granted() const { return update_rate_granted_; }
+
+	// Uplink packets/sec; 0 = whenever there is something to send. While auto_command_rate is on,
+	// picked from the server's report of our uplink instead (CmdRateAuto), up to p_max_hz, the rate
+	// commands are made; at that, whenever there is something to send.
+	void set_command_rate(double p_hz) {
+		command_rate_ = p_hz > 0.0 ? p_hz : 0.0;
+		apply_link();
+	}
+	double command_rate() const { return command_rate_; }
+	void set_auto_command_rate(bool p_on, double p_max_hz) {
+		auto_command_rate_ = p_on;
+		command_rate_max_ = p_max_hz > 0.0 ? p_max_hz : 0.0;
+		apply_link();
+	}
+	bool auto_command_rate() const { return auto_command_rate_; }
+
+	// Wire bytes each snapshot costs beyond its payload (headers below the protocol), for measuring
+	// what the downlink delivers.
+	void set_packet_overhead(int p_bytes) { packet_overhead_ = p_bytes > 0 ? p_bytes : 0; }
+
+	// How far behind its best the downlink arrives, ms, and what it delivers, bytes/sec on the wire.
+	uint32_t downlink_lag_ms() const { return downlink_.lag_ms(); }
+	double delivered_bps() const { return downlink_.delivered_bps(); }
+	// The server's last report of our uplink: how far behind its best it arrives, ms, and its packets
+	// arriving per second.
+	uint32_t uplink_lag_ms() const { return uplink_lag_ms_; }
+	uint32_t uplink_pps() const { return uplink_pps_; }
+
+	// Whether an uplink packet should go now: commands or messages due, or news the server is waiting on.
+	bool uplink_due(uint32_t p_now) const {
+		if (uplink_.due(p_now)) {
+			return true;
+		}
+		return news_ && uplink_.idle_ms(p_now) >= uplink_.interval_ms() + ACK_WAIT_SLACK_MS;
+	}
+
+	// Build the next uplink packet.
+	void write_uplink(uint32_t p_now, Writer &r_out) {
+		uplink_.write(p_now, ack_, chan_.ack_source(), r_out);
+		news_ = false;
+	}
 
 private:
 	// A frame is { net_id -> its slot values, in slot order }.
@@ -107,8 +194,42 @@ private:
 	ArrivalStats arrivals_;
 	uint16_t arrived_last_ = 0; // the newest seq seen; 0 = none yet
 	ChannelReceiver chan_;
+	CommandSender uplink_;
+	uint16_t ack_ = 0;    // the snapshot ack the next uplink packet carries; 0 = none
+	bool news_ = false;   // a snapshot arrived since the last uplink packet: an ack, or channel news
+	// Commands count as flowing while one was pushed within the command interval plus this.
+	static const uint32_t ACK_WAIT_SLACK_MS = 100;
 	void count_arrival(uint16_t p_seq);
+	void queue_ack(uint16_t p_seq, ApplyInfo &r_info) {
+		ack_ = p_seq;
+		news_ = true;
+		r_info.ack = p_seq;
+	}
 	static const uint32_t MAX_DEFER_STREAK = RING; // ~1s at 30 Hz before giving up on a warmup entity
+
+	uint32_t rate_ = 0;
+	bool auto_rate_ = false;
+	uint32_t update_rate_ = 0;
+	int update_rate_granted_ = -1;
+	double command_rate_ = 0.0;
+	bool auto_command_rate_ = false;
+	double command_rate_max_ = 0.0;
+	int packet_overhead_ = 0;
+	uint64_t received_bytes_ = 0; // on the wire, this session
+	DownlinkMeter downlink_;
+	CmdRateAuto cmd_auto_;
+	uint32_t uplink_lag_ms_ = 0;
+	uint32_t uplink_pps_ = 0;
+
+	// The settings, or the automatic picks, onto the uplink.
+	void apply_link() {
+		uplink_.set_rate(auto_rate_ ? (uint32_t)downlink_.rate() : rate_);
+		uplink_.set_update_rate(update_rate_);
+		const double hz = auto_command_rate_ ? cmd_auto_.rate() : command_rate_;
+		const bool every = hz <= 0.0 || (auto_command_rate_ && hz >= command_rate_max_);
+		uplink_.set_interval_ms(every ? 0 : (uint32_t)std::lround(1000.0 / hz));
+	}
+	void note_header(uint32_t p_now, uint32_t p_server_time, uint32_t p_lag_ms, uint32_t p_pps, uint32_t p_granted);
 };
 
 template <class V>
@@ -116,10 +237,11 @@ template <class Host>
 typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now) {
 	ApplyInfo info;
 	Reader r(p_data, p_size);
+	received_bytes_ += p_size + (size_t)packet_overhead_;
 
 	// Protocol guard: a mismatched build (different wire format) would misparse every field. Fail
 	// loudly once and drop, rather than flooding the log with decode errors.
-	if (r.get_u8() != SNAPSHOT_VERSION) {
+	if (r.get_u8() != WIRE_VERSION) {
 		if (!warned_mismatch_) {
 			warned_mismatch_ = true;
 			p_host.protocol_mismatch();
@@ -149,7 +271,8 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	if ((has_ && !seq_newer(seq, last_seq_)) || !chan_.accept(seq)) {
 		return info;
 	}
-	p_host.channel_ack(chan.ack);
+	uplink_.on_channel_ack(chan.ack, p_now);
+	news_ = true;
 	std::vector<std::vector<uint8_t>> reliable;
 	std::vector<std::vector<uint8_t>> unreliable;
 	if (!chan.take(chan_, p_now, reliable, unreliable)) {
@@ -166,10 +289,10 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	// client can drive a clock estimator from. Emitted after the stale-seq drop (a reordered
 	// snapshot's time is <= one already fed) but before the baseline-resolution drop below, so a
 	// forward snapshot we can't reconstruct for state still contributes its valid clock sample.
-	p_host.server_time(server_time);
-	p_host.command_ack(command_ack);
-	p_host.uplink_report(uplink_lag_ms, uplink_pps);
-	p_host.update_rate(update_rate);
+	note_header(p_now, server_time, uplink_lag_ms, uplink_pps, update_rate);
+	uplink_.on_ack(command_ack);
+	info.command_ack = command_ack;
+	p_host.server_time(server_time); // after note_header, so the host reads this header's link news
 
 	// Resolve the baseline frame we reconstruct this delta against. base_seq 0 means full state. If
 	// the server diffed against a frame we no longer hold, we can't reconstruct unchanged fields —
@@ -184,7 +307,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 			deliver(reliable, true);
 			deliver(unreliable, false);
 			if (has_) {
-				p_host.send_ack(last_seq_);
+				queue_ack(last_seq_, info);
 			}
 			return info;
 		}
@@ -326,7 +449,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	if ((spawn_refused || (defer_ack && has_)) && defer_streak_ < MAX_DEFER_STREAK) {
 		defer_streak_++;
 		if (has_) {
-			p_host.send_ack(last_seq_);
+			queue_ack(last_seq_, info);
 		}
 		return info;
 	}
@@ -338,9 +461,29 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	frame_seq_[slot] = seq;
 	last_seq_ = seq;
 	has_ = true;
-	p_host.send_ack(seq);
+	queue_ack(seq, info);
 	info.committed = true;
 	return info;
+}
+
+// An in-order header's link news: the downlink's lag and what arrived, the server's report of the
+// uplink, and the update rate it granted. The automatic picks follow from them.
+template <class V>
+void Client<V>::note_header(uint32_t p_now, uint32_t p_server_time, uint32_t p_lag_ms, uint32_t p_pps,
+		uint32_t p_granted) {
+	if (downlink_.sample_due(p_now)) {
+		downlink_.sample(p_now, received_bytes_, arrivals_.received, arrivals_.lost);
+	}
+	downlink_.note(p_now, p_server_time);
+	uplink_lag_ms_ = p_lag_ms;
+	uplink_pps_ = p_pps;
+	update_rate_granted_ = (int)p_granted;
+	if (auto_command_rate_) {
+		cmd_auto_.note(p_now, (double)p_lag_ms, (double)p_pps, command_rate_max_);
+	}
+	if (auto_rate_ || auto_command_rate_) {
+		apply_link();
+	}
 }
 
 template <class V>

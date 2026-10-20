@@ -238,7 +238,7 @@ static void test_malformed_input() {
 	}
 	CHECK(h.got.empty() && h.snapshot_acks.empty());
 	std::vector<uint8_t> bad(w.data(), w.data() + w.size());
-	bad[0] = SNAPSHOT_VERSION + 1;
+	bad[0] = WIRE_VERSION + 1;
 	CHECK(!r.receive(3, bad.data(), bad.size(), h, 0));
 	CHECK(!r.receive(3, bad.data(), bad.size(), h, 0));
 	CHECK(h.mismatches == 1);

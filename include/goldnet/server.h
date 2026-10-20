@@ -31,9 +31,9 @@
 // first time the entity is visible to it (see SpawnRecord::vis_keys), goes in that snapshot and
 // the RELIABLE_BACKUP after it, then again whenever it is overdue, until the peer acks a snapshot
 // carrying it; the despawn reaches only peers that got it, the same way. Until a spawn is proven
-// delivered, the entities in its vis_keys don't count as held by the peer, so each snapshot sends
-// them whole: a client that missed the spawn discards their deltas, and acking those must not
-// leave the server believing it has them.
+// delivered, the entity at its net_id and the entities in its vis_keys don't count as held by the
+// peer, so each snapshot sends them whole: a client that missed the spawn discards their deltas,
+// and acking those must not leave the server believing it has them.
 //
 // On the client, Client::apply() hands each spawn to the host's spawn() before it reads the
 // deltas, so by the time spawn() returns, registered() and begin_entity() must know the entity.
@@ -42,17 +42,16 @@
 // spawn(), and one that has it but can't take values yet sets begin_entity's r_defer; either way
 // the client withholds the ack and the server keeps offering it (Client::apply has the details).
 //
-// The uplink. receive_uplink() takes each packet a peer sends: the CommandReceiver delivers its
-// commands and messages to the host, and the server takes the rest, the acks and what the client
-// asks for. The host passed to it provides:
+// The uplink. receive_uplink() takes each packet a peer sends: its commands and messages go to the
+// host, and the server takes the rest, the acks and what the client asks for. The host passed to it
+// provides:
 //   void protocol_mismatch(int32_t peer)            a different build is talking to us (once per peer)
 //   void command(int32_t peer, uint32_t stream_id, const uint8_t *data, size_t size)
 //   void message(int32_t peer, const uint8_t *data, size_t size, bool reliable)
 //
 // Messages. Each peer's snapshots carry its end of a GoldSrc netchan (netchan.h): queue_reliable and
 // queue_unreliable put the host's messages in the peer's next snapshots, ahead of the entities in the
-// packet budget. The client's half of the acks arrives in its uplink (on_channel_ack), and what the
-// server took from the client's uplink goes back in each header (set_uplink_ack).
+// packet budget. The acks for both directions ride the uplink and the snapshot header.
 //
 #include "goldnet/buffer.h"
 #include "goldnet/codec.h"
@@ -107,7 +106,8 @@ public:
 	// A runtime entity's creation record, replayed to each peer the first time the entity is
 	// visible to it. spawner_net_id names what creates it on the client (0 = none) and goes on the
 	// wire with data, which is opaque to the protocol. node_key is the host's own; the server never
-	// reads it. vis_keys are the keys to ask spawn_visible() about.
+	// reads it. vis_keys are the keys to ask spawn_visible() about, and the entities beyond the one
+	// at the spawn's net_id that the spawn creates.
 	struct SpawnRecord {
 		uint32_t spawner_net_id = 0;
 		uint64_t node_key = 0;
@@ -216,13 +216,11 @@ public:
 
 	// --- Peers ---
 
-	// GoldSrc cl_updaterate: the snapshots/sec this peer asks for (CommandReceiver::update_rate); 0 =
-	// as many as the server sends. It is granted that, under the snapshot rate and under what its rate
-	// can carry in idle snapshots, and at least MIN_UPDATE_RATE, without slowing anyone else down.
-	// Dropped with the peer.
-	void set_peer_update_rate(int32_t p_peer, uint32_t p_hz) { rings_[p_peer].update_rate_asked = p_hz; }
-	// What p_peer was granted at its last tick, snapshots/sec, as its headers tell it; 0 = every tick,
-	// at a rate the server doesn't know.
+	// GoldSrc cl_updaterate. A peer asks for a number of snapshots/sec in its uplink (0 = as many as
+	// the server sends) and is granted that, under the snapshot rate and under what its rate can carry
+	// in idle snapshots, and at least MIN_UPDATE_RATE, without slowing anyone else down. This is what
+	// p_peer was granted at its last tick, as its headers tell it; 0 = every tick, at a rate the server
+	// doesn't know.
 	uint32_t update_rate(int32_t p_peer) const {
 		auto it = rings_.find(p_peer);
 		return it == rings_.end() ? 0 : it->second.update_rate;
@@ -232,13 +230,12 @@ public:
 	void set_snapshot_rate(double p_hz) { snapshot_rate_ = p_hz > 0.0 ? p_hz : 0.0; }
 	double snapshot_rate() const { return snapshot_rate_; }
 
-	// GoldSrc rate / choke: the most bytes per second this peer's link takes (0 = unlimited). Every
-	// send to the peer — snapshots here, and whatever else the host reports through charge() —
-	// pushes its clear time out by bytes / rate. While that's in the future the peer is choked: it
-	// gets no snapshot this tick, and the next one it does get deltas against its acked baseline,
-	// so it carries the latest state rather than a backlog. A slow link then gets fewer snapshots
-	// instead of a queue that delays every one of them.
-	void set_peer_rate(int32_t p_peer, uint32_t p_bps) { rings_[p_peer].rate_bps = p_bps; }
+	// GoldSrc rate / choke: the most bytes per second this peer's link takes, as it asks in its uplink
+	// (at least MIN_RATE; 0 = unlimited). Every send to the peer — snapshots here, and whatever else the
+	// host reports through charge() — pushes its clear time out by bytes / rate. While that's in the
+	// future the peer is choked: it gets no snapshot this tick, and the next one it does get deltas
+	// against its acked baseline, so it carries the latest state rather than a backlog. A slow link
+	// then gets fewer snapshots instead of a queue that delays every one of them.
 	uint32_t peer_rate(int32_t p_peer) const {
 		auto it = rings_.find(p_peer);
 		return it == rings_.end() ? 0 : it->second.rate_bps;
@@ -255,33 +252,22 @@ public:
 		const double start = pr.clear_at_ms > (double)p_now ? pr.clear_at_ms : (double)p_now;
 		pr.clear_at_ms = start + (double)p_bytes * 1000.0 / (double)pr.rate_bps;
 	}
-	// The newest command this peer sent that the host has delivered with none missing before it
-	// (CommandReceiver::ack), carried in the peer's next snapshot header. 0 = none. p_news
-	// (CommandReceiver::take_news) earns a snapshot even when the ack hasn't moved.
-	void set_command_ack(int32_t p_peer, uint16_t p_seq, bool p_news = false) {
-		PeerRing &pr = rings_[p_peer];
-		pr.cmd_ack = p_seq;
-		pr.cmd_news = pr.cmd_news || p_news;
-	}
-
-	// How far behind its best this peer's uplink arrives, ms, and its packets arriving per second
-	// (CommandReceiver::uplink_lag_ms / uplink_pps), carried in the peer's next snapshot header for its
-	// CmdRateAuto.
-	void set_uplink_report(int32_t p_peer, uint32_t p_lag_ms, uint32_t p_pps) {
-		PeerRing &pr = rings_[p_peer];
-		pr.uplink_lag_ms = p_lag_ms;
-		pr.uplink_pps = p_pps;
-	}
 
 	// --- The uplink (uplink.h) ---
 
-	// One uplink packet from p_peer, through p_receiver: its commands and messages go to p_host, its
-	// snapshot and channel acks to this server, and the peer's next header gets the command ack, the
-	// uplink ack and the uplink report. The rate it asks for (at least MIN_RATE) and its update rate
-	// apply from here on. False if the packet was malformed or from a mismatched build.
+	// One uplink packet from p_peer: its commands and messages go to p_host, its snapshot and channel
+	// acks to this server, and the peer's next header gets the command ack, the uplink ack and the
+	// uplink report. The rate and update rate it asks for apply from here on. False if the packet was
+	// malformed or from a mismatched build.
 	template <class Host>
-	bool receive_uplink(int32_t p_peer, CommandReceiver &p_receiver, const uint8_t *p_data, size_t p_size,
-			Host &p_host, uint32_t p_now);
+	bool receive_uplink(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now);
+
+	// How far behind its best p_peer's uplink arrives, ms, and its packets arriving per second, as its
+	// snapshot headers report them to its CmdRateAuto.
+	uint32_t uplink_lag_ms(int32_t p_peer) const { return uplink_.uplink_lag_ms(p_peer); }
+	uint32_t uplink_pps(int32_t p_peer) const { return uplink_.uplink_pps(p_peer); }
+	// Commands p_peer gave up on before they arrived.
+	uint32_t skipped_commands(int32_t p_peer) const { return uplink_.skipped(p_peer); }
 
 	// --- Messages (netchan.h) ---
 
@@ -309,17 +295,6 @@ public:
 		auto it = rings_.find(p_peer);
 		return it == rings_.end() ? 0 : it->second.dgram.dropped();
 	}
-	// From the peer's uplink: what it has received of the server's channel.
-	void on_channel_ack(int32_t p_peer, const ChannelAck &p_ack) {
-		auto it = rings_.find(p_peer);
-		if (it != rings_.end()) {
-			it->second.rel.on_ack(p_ack);
-		}
-	}
-	// What the server has received of the peer's channel (CommandReceiver::channel_ack), for its next
-	// header. A new block bit or fragment earns a snapshot of its own: it is what lets the peer send on.
-	void set_uplink_ack(int32_t p_peer, const ChannelAckSource &p_src) { rings_[p_peer].uplink = p_src; }
-
 	// Snapshots withheld from this peer by its rate so far (GoldSrc's choke count).
 	uint32_t chokes(int32_t p_peer) const {
 		auto it = rings_.find(p_peer);
@@ -333,6 +308,7 @@ public:
 
 	void remove_peer(int32_t p_peer) {
 		rings_.erase(p_peer);
+		uplink_.remove_peer(p_peer);
 		// Drop the peer from any despawn needer-set so those despawns can still retire.
 		for (auto it = despawn_pending_.begin(); it != despawn_pending_.end();) {
 			it->second.erase(p_peer);
@@ -344,6 +320,11 @@ public:
 		}
 	}
 
+	// Build and send this tick's snapshot to every peer that is due one.
+	template <class Host>
+	void tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Host &p_host);
+
+private:
 	// A client acked the newest frame it received. Advances that peer's delta baseline.
 	void on_ack(int32_t p_peer, uint16_t p_seq, uint32_t p_now) {
 		auto rit = rings_.find(p_peer);
@@ -386,11 +367,14 @@ public:
 		}
 	}
 
-	// Build and send this tick's snapshot to every peer that is due one.
-	template <class Host>
-	void tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Host &p_host);
+	// From the peer's uplink: what it has received of the server's channel.
+	void on_channel_ack(int32_t p_peer, const ChannelAck &p_ack) {
+		auto it = rings_.find(p_peer);
+		if (it != rings_.end()) {
+			it->second.rel.on_ack(p_ack);
+		}
+	}
 
-private:
 	// What the peer HAD at each frame, as net_ids only — values live once, on the entity, and
 	// slot_ctr answers "did this change since the peer's baseline" directly. All a frame has to
 	// remember is WHICH entities the peer had, so a re-entering entity still gets a full state
@@ -434,7 +418,7 @@ private:
 		// window must ship a full baseline, not a slot delta against a frame the peer no longer
 		// matches. Soft state: losing it only costs a redundant full baseline.
 		IdSet left_unacked;
-		uint32_t update_rate_asked = 0; // see set_peer_update_rate
+		uint32_t update_rate_asked = 0; // from the uplink; see update_rate()
 		uint32_t update_rate = 0;       // granted, rounded, as the header carries it
 		// When this peer was last considered for a send, for the cadence check. Advances even on a
 		// tick that decides to send nothing.
@@ -448,17 +432,20 @@ private:
 		// most-overdue, highest-weighted entity goes first. Only a successful write resets it, not
 		// merely a later tick touching it again.
 		std::unordered_map<uint32_t, uint32_t> stale_since;
-		uint16_t cmd_ack = 0;      // see set_command_ack
+		// The newest command delivered with none missing before it, for the next header; 0 = none.
+		uint16_t cmd_ack = 0;
 		uint16_t cmd_ack_sent = 0; // what the last snapshot told the peer, so a new one earns a send
-		bool cmd_news = false;     // see set_command_ack
-		uint32_t uplink_lag_ms = 0; // see set_uplink_report
+		bool cmd_news = false;     // CommandReceiver::take_news: earns a snapshot though the ack hasn't moved
+		uint32_t uplink_lag_ms = 0; // the uplink report, for the next header
 		uint32_t uplink_pps = 0;
-		uint32_t rate_bps = 0;     // see set_peer_rate; 0 = unlimited
+		uint32_t rate_bps = 0;     // see peer_rate; 0 = unlimited
 		double clear_at_ms = 0.0;  // when what's been sent to this peer has cleared its rate
 		uint32_t chokes = 0;
 		ReliableSender rel;
 		DatagramSender dgram;
-		ChannelAckSource uplink; // see set_uplink_ack
+		// What the server has received of the peer's channel, for its next header. A new block bit or
+		// fragment earns a snapshot of its own: it is what lets the peer send on.
+		ChannelAckSource uplink;
 		ChannelAck uplink_sent;  // what the last snapshot told the peer
 	};
 
@@ -477,6 +464,7 @@ private:
 	// once every such peer acks a frame carrying it.
 	std::unordered_map<uint32_t, std::unordered_set<int32_t>> despawn_pending_;
 	std::unordered_map<int32_t, PeerRing> rings_;
+	CommandReceiver uplink_;
 	// Monotonic snapshot counter, bumped once per tick that sends anything. It stamps
 	// Entity::slot_ctr and PeerRing::frame_ctr so change tests are a single integer compare. Unlike
 	// the 16-bit wire seq it never wraps in any realistic session (2^32 ticks at 60 Hz is ~2 years).
@@ -486,8 +474,9 @@ private:
 	bool relevance_events_ = false;
 	std::vector<size_t> live_; // scratch: entities live this tick
 	std::unordered_set<uint64_t> unproven_; // scratch: entity keys whose spawn this peer may lack
+	std::unordered_set<uint32_t> unproven_ids_; // scratch: the same, by the spawn's own net_id
 
-	// See set_peer_update_rate. 0 = every tick.
+	// See update_rate(). 0 = every tick.
 	double grant(const PeerRing &p_pr) const {
 		double hz = (double)p_pr.update_rate_asked;
 		if (p_pr.rate_bps > 0) {
@@ -513,8 +502,8 @@ private:
 
 template <class V, class X>
 template <class Host>
-bool Server<V, X>::receive_uplink(int32_t p_peer, CommandReceiver &p_receiver, const uint8_t *p_data,
-		size_t p_size, Host &p_host, uint32_t p_now) {
+bool Server<V, X>::receive_uplink(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host,
+		uint32_t p_now) {
 	struct Router {
 		Server &server;
 		Host &host;
@@ -526,13 +515,16 @@ bool Server<V, X>::receive_uplink(int32_t p_peer, CommandReceiver &p_receiver, c
 		void message(int32_t p, const uint8_t *d, size_t n, bool reliable) { host.message(p, d, n, reliable); }
 	};
 	Router router{ *this, p_host, p_now };
-	const bool ok = p_receiver.receive(p_peer, p_data, p_size, router, p_now);
-	set_command_ack(p_peer, p_receiver.ack(p_peer), p_receiver.take_news(p_peer));
-	set_uplink_ack(p_peer, p_receiver.channel_ack(p_peer));
-	set_uplink_report(p_peer, p_receiver.uplink_lag_ms(p_peer), p_receiver.uplink_pps(p_peer));
-	const uint32_t rate = p_receiver.rate(p_peer);
-	set_peer_rate(p_peer, rate > 0 && rate < MIN_RATE ? MIN_RATE : rate);
-	set_peer_update_rate(p_peer, p_receiver.update_rate(p_peer));
+	const bool ok = uplink_.receive(p_peer, p_data, p_size, router, p_now);
+	PeerRing &pr = rings_[p_peer];
+	pr.cmd_ack = uplink_.ack(p_peer);
+	pr.cmd_news = pr.cmd_news || uplink_.take_news(p_peer);
+	pr.uplink = uplink_.channel_ack(p_peer);
+	pr.uplink_lag_ms = uplink_.uplink_lag_ms(p_peer);
+	pr.uplink_pps = uplink_.uplink_pps(p_peer);
+	const uint32_t rate = uplink_.rate(p_peer);
+	pr.rate_bps = rate > 0 && rate < MIN_RATE ? MIN_RATE : rate;
+	pr.update_rate_asked = uplink_.update_rate(p_peer);
 	return ok;
 }
 
@@ -633,11 +625,13 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		uint16_t spawn_ct = 0;
 		const uint32_t overdue = overdue_ms(pr.srtt_ms);
 		unproven_.clear();
+		unproven_ids_.clear();
 		for (const auto &kv : spawns_) {
 			if (pr.spawn_acked.count(kv.first)) {
 				continue; // peer already has this node — don't re-arm the spawn every frame
 			}
 			unproven_.insert(kv.second.vis_keys.begin(), kv.second.vis_keys.end());
+			unproven_ids_.insert(kv.first);
 			// Lazy spawn (GoldSrc): defer sending the spawn to this peer until the entity is visible
 			// to it — created client-side the first time it enters your PVS. Once delivered it
 			// PERSISTS (spawn_acked keeps it; despawn only on server-free), so there's no
@@ -719,7 +713,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 			// it (an idle entity re-entering changes no slot at all).
 			uint32_t mask = 0;
 			const int n_vals = (int)e.vals.size();
-			const bool holdable = !unproven_.count(e.key);
+			const bool holdable = !unproven_.count(e.key) && !unproven_ids_.count(net_id);
 			if (!base || !base->count(net_id) || pr.left_unacked.count(net_id)) {
 				mask = n_vals >= MAX_SLOTS ? 0xFFFFFFFFu : ((1u << n_vals) - 1u); // new → all slots
 			} else {
@@ -856,7 +850,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		pr.frame_ms[slot] = p_now;
 
 		Writer packet;
-		packet.put_u8(SNAPSHOT_VERSION);
+		packet.put_u8(WIRE_VERSION);
 		packet.put_u16(seq);
 		packet.put_u16(base_seq);
 		packet.put_u32(p_now);

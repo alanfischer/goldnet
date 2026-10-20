@@ -127,9 +127,7 @@ struct ClientCore {
 	int fd = -1;
 	sockaddr_in server_addr = {};
 	Client<Value> client;
-	CommandSender commands;
 	NetSim<std::vector<uint8_t>> up_sim, down_sim; // both legs of this client's link
-	uint16_t snapshot_ack = 0;
 
 	Sim sim; // the prediction world: the arena, your player, stand-ins for everything else
 	std::map<uint32_t, Ent> ents;
@@ -185,16 +183,6 @@ struct ClientCore {
 			clock_offset += (off - clock_offset) * 0.01; // drift and route changes, slowly
 		}
 	}
-	void command_ack(uint16_t seq) {
-		commands.on_ack(seq);
-		if (seq != 0) {
-			acked = seq;
-		}
-	}
-	void uplink_report(uint32_t, uint32_t) {}
-	void update_rate(uint32_t) {}
-	void channel_ack(const ChannelAck &ack) { commands.on_channel_ack(ack, now_ms()); }
-	void send_ack(uint16_t seq) { snapshot_ack = seq; }
 	void message(const uint8_t *data, size_t size, bool) {
 		if (size >= 5 && data[0] == MSG_YOU) {
 			my_id = get_u32_le(data + 1);
@@ -297,10 +285,8 @@ struct ClientCore {
 
 	void new_session() {
 		client.reset();
-		commands.reset();
-		commands.set_update_rate(30);
-		commands.set_rate(40000);
-		snapshot_ack = 0;
+		client.set_update_rate(30);
+		client.set_rate(40000);
 		acked = 0;
 		for (auto &kv : ents) {
 			if (kv.second.proxy) {
@@ -392,6 +378,9 @@ struct ClientCore {
 		cur.snapshots++;
 		fresh = false;
 		const auto info = client.apply(pkt.data(), pkt.size(), *this, now_ms());
+		if (info.command_ack != 0) {
+			acked = info.command_ack;
+		}
 		if (fresh && info.committed) {
 			on_snapshot();
 		}
@@ -509,7 +498,7 @@ struct ClientCore {
 		in = quantize(in);
 		uint8_t bytes[INPUT_BYTES];
 		write_input(in, bytes);
-		const uint16_t seq = commands.push(CMD_STREAM, bytes, sizeof(bytes), now);
+		const uint16_t seq = client.uplink().push(CMD_STREAM, bytes, sizeof(bytes), now);
 		history.push_back({ seq, in });
 		while (history.size() > COMMAND_RING) {
 			history.pop_front();
@@ -538,10 +527,10 @@ struct ClientCore {
 			}
 		}
 
-		if (connected && commands.due(now)) {
+		if (connected && client.uplink_due(now)) {
 			Writer w;
 			w.put_u8('U');
-			commands.write(now, snapshot_ack, client.channel_ack(), w);
+			client.write_uplink(now, w);
 			through(up_sim, std::vector<uint8_t>(w.data(), w.data() + w.size()),
 					[&](std::vector<uint8_t> &p) { transmit(p); });
 		}
@@ -593,7 +582,7 @@ struct ClientCore {
 		return true;
 	}
 
-	float ping_ms() const { return (float)commands.rtt_ms(); }
+	float ping_ms() const { return (float)client.uplink().rtt_ms(); }
 };
 
 } // namespace shove

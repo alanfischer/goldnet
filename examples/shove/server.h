@@ -81,7 +81,6 @@ struct ServerApp {
 	int fd = -1;
 	Sim sim;
 	GServer server;
-	CommandReceiver receiver;
 	NetSim<Outgoing> netsim;
 	std::map<uint32_t, SPlayer> players;
 	std::map<uint32_t, SBlock> blocks;
@@ -482,7 +481,7 @@ struct ServerApp {
 			} else if (buf[0] == 'U' && it != by_addr.end()) {
 				const int32_t peer = it->second;
 				peers[peer].last_heard = now;
-				server.receive_uplink(peer, receiver, buf + 1, (size_t)n - 1, *this, now_ms());
+				server.receive_uplink(peer, buf + 1, (size_t)n - 1, *this, now_ms());
 			}
 			len = sizeof(from);
 		}
@@ -529,7 +528,6 @@ struct ServerApp {
 		by_addr.erase(addr_key(peers[peer].addr));
 		peers.erase(peer);
 		server.remove_peer(peer);
-		receiver.remove_peer(peer);
 		netsim.forget_link(peer);
 	}
 
@@ -578,7 +576,7 @@ struct ServerApp {
 			for (auto &kv : peers) {
 				const SPlayer *p = players.count(kv.second.player) ? &players[kv.second.player] : nullptr;
 				printf("[server]   peer %d: %u commands/s, update rate %u, %u given up on\n", kv.first,
-						p ? p->commands : 0, server.update_rate(kv.first), receiver.skipped(kv.first));
+						p ? p->commands : 0, server.update_rate(kv.first), server.skipped_commands(kv.first));
 			}
 			for (auto &kv : players) {
 				kv.second.commands = 0;
