@@ -244,7 +244,7 @@ struct ClientCore {
 	void relevance_lost(uint32_t) {}
 	bool registered(uint32_t net_id) { return ents.count(net_id) > 0; }
 	uint32_t cur_id = 0;
-	int begin_entity(uint32_t net_id, uint32_t, bool &) {
+	int begin_entity(uint32_t net_id, uint32_t, bool, uint8_t, bool &) {
 		auto it = ents.find(net_id);
 		if (it == ents.end()) {
 			return -1;
@@ -261,7 +261,7 @@ struct ClientCore {
 			ents[cur_id].has_state = true;
 		}
 	}
-	Value decode(Reader &r, uint32_t) { return decode_value(r); }
+	Value decode(Reader &r, int, const Value *, uint32_t) { return decode_value(r); }
 
 	// --- the session ---
 

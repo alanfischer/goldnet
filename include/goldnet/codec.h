@@ -94,24 +94,30 @@ uint32_t get_uvarint(const B &buf) {
 
 // --- angle quantization ---
 //
-// A full turn folded onto a u16: ~0.0055° steps, 2 bytes instead of 4. The fold is
-// what makes this safe for yaw/pitch that accumulate without bound — TAU and 0 both
-// land on 0, and negatives wrap up into range rather than truncating toward zero.
-
-template <typename B>
-void put_angle16(const B &buf, float radians) {
+// A full turn folded onto 2^bits steps, rounded to the nearest. The fold is what makes this safe
+// for yaw/pitch that accumulate without bound — TAU and 0 both land on 0, and negatives wrap up
+// into range rather than truncating toward zero. Rounding, not truncating, makes it idempotent: an
+// angle that came off the wire quantizes back to the same step, which a host stepping from a value
+// the peer holds relies on.
+inline uint32_t angle_quanta(float radians, int bits) {
 	float t = fmodf(radians, TAU);
 	// NaN/inf guard: fmodf(NaN or ±inf, TAU) == NaN, and casting NaN — or the boundary value that
-	// rounds to exactly 65536.0 — straight to uint16 is undefined behaviour (a debug build traps it,
-	// crashing the server). Sanitize to 0 and go through uint32+mask so the wrap is well-defined.
+	// rounds to exactly 2^bits — straight to the narrow type is undefined behaviour (a debug build
+	// traps it, crashing the server). Sanitize to 0 and go through uint32+mask so the wrap is
+	// well-defined.
 	if (std::isnan(t)) {
 		t = 0.0f;
 	} else if (t < 0.0f) {
 		t += TAU;
 	}
-	// [0,TAU) → [0,65536); cast through uint32 (always in range) then mask to 16 bits so the boundary
-	// 65536 wraps to 0 without the out-of-range float→uint16 cast the comment used to rely on.
-	buf->put_u16((uint16_t)((uint32_t)((t / TAU) * 65536.0f) & 0xFFFFu));
+	const uint32_t full = 1u << bits;
+	return (uint32_t)lroundf((t / TAU) * (float)full) & (full - 1u);
+}
+
+// A full turn on a u16: ~0.0055° steps, 2 bytes instead of 4.
+template <typename B>
+void put_angle16(const B &buf, float radians) {
+	buf->put_u16((uint16_t)angle_quanta(radians, 16));
 }
 
 template <typename B>
@@ -125,15 +131,7 @@ float get_angle16(const B &buf) {
 
 template <typename B>
 void put_angle8(const B &buf, float radians) {
-	float t = fmodf(radians, TAU);
-	if (std::isnan(t)) {
-		t = 0.0f;
-	} else if (t < 0.0f) {
-		t += TAU;
-	}
-	// [0,TAU) → [0,256); cast through uint32 then mask to 8 bits so the 256 boundary wraps to 0,
-	// same reasoning as angle16's 65536 boundary above.
-	buf->put_u8((uint8_t)((uint32_t)((t / TAU) * 256.0f) & 0xFFu));
+	buf->put_u8((uint8_t)angle_quanta(radians, 8));
 }
 
 template <typename B>

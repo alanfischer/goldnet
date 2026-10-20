@@ -10,7 +10,7 @@ namespace goldnet {
 // change, so a mismatched build fails loudly (one warning, packets dropped) instead of misparsing
 // every packet. One byte only has to tell "same build" from "not": the packet already arrives on
 // goldnet's own channel.
-static const uint8_t WIRE_VERSION = 9;
+static const uint8_t WIRE_VERSION = 10;
 
 // Frames of history kept per peer (server) and received (client). A power of two: slots are
 // indexed by seq & (RING - 1). ~1s at 30 Hz — covers ack RTT + loss.
@@ -18,6 +18,11 @@ static const int RING = 32;
 
 // Max replicated slots per entity — the width of the u32 changed-field bitmask.
 static const int MAX_SLOTS = 32;
+
+// Changes the server keeps per slot, so a slot can be coded as its change from the value a peer
+// holds at its baseline (see Server::stamp). ~1 s of a slot that changes every tick at 60 Hz; a
+// baseline older than that gets the slot's value whole instead.
+static const int SLOT_HISTORY = 64;
 
 // Max PVS-leave markers per snapshot (4 bytes each on the wire). A fresh peer's relevance seed can
 // queue hundreds of leaves (every out-of-PVS entity on a big map); emitting them all in one frame
