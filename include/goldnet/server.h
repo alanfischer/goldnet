@@ -850,7 +850,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		pr.frame_ms[slot] = p_now;
 
 		Writer packet;
-		packet.put_u8(SNAPSHOT_VERSION);
+		packet.put_u8(WIRE_VERSION);
 		packet.put_u16(seq);
 		packet.put_u16(base_seq);
 		packet.put_u32(p_now);

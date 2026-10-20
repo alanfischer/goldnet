@@ -88,8 +88,6 @@ struct Peer {
 	std::vector<uint32_t> spawned, despawned, lost;
 	std::vector<uint16_t> acks;
 	std::vector<uint32_t> times;
-	std::vector<std::pair<uint32_t, uint32_t>> uplink_reports; // lag_ms, pps
-	std::vector<uint32_t> update_rates;
 	std::vector<std::pair<std::vector<uint8_t>, bool>> messages; // bytes, reliable
 	std::vector<std::string> events; // spawns, messages and despawns, in the order the host saw them
 	int mismatches = 0;
@@ -102,8 +100,6 @@ struct TestClientHost {
 	Peer *p;
 	void protocol_mismatch() { p->mismatches++; }
 	void server_time(uint32_t ms) { p->times.push_back(ms); }
-	void uplink_report(uint32_t lag_ms, uint32_t pps) { p->uplink_reports.push_back({ lag_ms, pps }); }
-	void update_rate(uint32_t hz) { p->update_rates.push_back(hz); }
 	void message(const uint8_t *data, size_t size, bool reliable) {
 		p->messages.push_back({ std::vector<uint8_t>(data, data + size), reliable });
 		p->events.push_back((reliable ? "r" : "u") + std::to_string(data[0]));
@@ -372,7 +368,7 @@ static void test_truncated_packet_not_committed() {
 
 static void test_protocol_mismatch_warns_once() {
 	Peer p;
-	uint8_t bad[] = { (uint8_t)(SNAPSHOT_VERSION + 1), 0, 0, 0, 0 };
+	uint8_t bad[] = { (uint8_t)(WIRE_VERSION + 1), 0, 0, 0, 0 };
 	TestClientHost ch{ &p };
 	CHECK(p.client.apply(bad, sizeof(bad), ch, 0).ack == 0);
 	p.client.apply(bad, sizeof(bad), ch, 0);
@@ -743,7 +739,7 @@ static void test_update_rate_throttles_one_peer() {
 	Peer &slow = n.add_peer(3);
 	n.add_entity(10, 100, { 0 });
 	n.server.set_snapshot_rate(60.0);
-	slow.client.uplink().set_update_rate(20);
+	slow.client.set_update_rate(20);
 	n.send_uplink(slow);
 	int fast_sent = 0, slow_sent = 0;
 	for (int i = 0; i < 30; i++) {
@@ -755,7 +751,7 @@ static void test_update_rate_throttles_one_peer() {
 	CHECK(fast_sent == 30);
 	CHECK(slow_sent == 10);             // every 3rd tick, though the gaps measure 49 ms
 	CHECK(slow.vals[100][0] >= 27);     // and it still converges
-	CHECK(fast.update_rates.back() == 60 && slow.update_rates.back() == 20);
+	CHECK(fast.client.update_rate_granted() == 60 && slow.client.update_rate_granted() == 20);
 	printf("  an update rate throttles only that peer, every nth tick: ok\n");
 }
 
@@ -766,8 +762,8 @@ static void test_update_rate_grant() {
 	Peer &p = n.add_peer(2);
 	n.add_entity(10, 100, { 0 });
 	auto granted = [&n, &p](uint32_t asked, uint32_t rate) {
-		p.client.uplink().set_update_rate(asked);
-		p.client.uplink().set_rate(rate);
+		p.client.set_update_rate(asked);
+		p.client.set_rate(rate);
 		n.send_uplink(p);
 		n.tick(1000);
 		return n.server.update_rate(2);
@@ -845,7 +841,7 @@ static void test_rate_chokes_to_the_budget() {
 	for (int i = 0; i < 10; i++) {
 		n.add_entity(10 + i, 100 + i, { 0, 0 });
 	}
-	slow.client.uplink().set_rate(2000); // bytes per second
+	slow.client.set_rate(2000); // bytes per second
 	n.send_uplink(slow);
 	size_t fast_bytes = 0, slow_bytes = 0;
 	int fast_packets = 0, slow_packets = 0;
@@ -876,7 +872,7 @@ static void test_charged_traffic_delays_the_next_snapshot() {
 	Net n;
 	Peer &p = n.add_peer(2);
 	n.add_entity(10, 100, { 0 });
-	p.client.uplink().set_rate(10000); // fast enough that its update rate isn't what holds it back
+	p.client.set_rate(10000); // fast enough that its update rate isn't what holds it back
 	n.send_uplink(p);
 	n.tick();                          // the first snapshot goes out
 	n.server.charge(2, n.now, 2500);   // then the host sends two RPC bursts, 5000 bytes in all:
@@ -922,11 +918,10 @@ static void test_receive_uplink_takes_the_whole_packet() {
 	n.tick();
 	CHECK(base_seq_of(n.last_packet(2)) == 0);
 
-	CommandSender &up = p.client.uplink();
-	up.set_rate(20000);
-	up.set_update_rate(20);
+	p.client.set_rate(20000);
+	p.client.set_update_rate(20);
 	const uint8_t cmd[3] = { 1, 2, 3 };
-	up.push(1, cmd, sizeof(cmd), n.now);
+	p.client.uplink().push(1, cmd, sizeof(cmd), n.now);
 	CHECK(n.send_uplink(p));
 	CHECK(n.uplink_host.commands == std::vector<std::vector<uint8_t>>{ std::vector<uint8_t>(cmd, cmd + 3) });
 	CHECK(n.server.peer_rate(2) == 20000);
@@ -937,10 +932,10 @@ static void test_receive_uplink_takes_the_whole_packet() {
 	}
 	CHECK(n.sent_to(2) == 1);
 	CHECK(base_seq_of(n.last_packet(2)) == p.acks.front()); // the uplink's snapshot ack landed
-	CHECK(up.pending() == 0);                               // and its command was acked
-	CHECK(n.server.update_rate(2) == 20 && p.update_rates.back() == 20);
+	CHECK(p.client.uplink().pending() == 0);                // and its command was acked
+	CHECK(n.server.update_rate(2) == 20 && p.client.update_rate_granted() == 20);
 
-	up.set_rate(200); // under the floor
+	p.client.set_rate(200); // under the floor
 	n.send_uplink(p);
 	CHECK(n.server.peer_rate(2) == MIN_RATE);
 	printf("  receive_uplink takes the commands, the acks and the rates: ok\n");
@@ -955,11 +950,37 @@ static void test_uplink_report_rides_the_header() {
 		n.world.ents[10].vals[0] = i;
 		n.tick();
 	}
-	CHECK(!p.uplink_reports.empty());
-	const std::pair<uint32_t, uint32_t> r = p.uplink_reports.back();
-	CHECK(r.first == 0 && r.second >= 55 && r.second <= 70);
-	CHECK(n.server.uplink_pps(2) == r.second);
+	CHECK(p.client.uplink_lag_ms() == 0);
+	CHECK(p.client.uplink_pps() >= 55 && p.client.uplink_pps() <= 70);
+	CHECK(n.server.uplink_pps(2) == p.client.uplink_pps());
 	printf("  the uplink report rides the snapshot header: ok\n");
+}
+
+// The settings, or the automatic picks, are what the uplink goes by; a new session starts the picks
+// over and keeps the settings.
+static void test_link_settings_reach_the_uplink() {
+	Net n;
+	Peer &p = n.add_peer(2);
+	n.add_entity(10, 100, { 0 });
+	Client<Val> &c = p.client;
+	c.set_rate(5000);
+	c.set_command_rate(20.0);
+	CHECK(c.uplink().rate() == 5000 && c.uplink().interval_ms() == 50);
+	c.set_auto_rate(true);
+	CHECK(c.uplink().rate() == 0);         // no limit until the downlink queues
+	c.set_auto_command_rate(true, 60.0);
+	CHECK(c.uplink().interval_ms() == 50); // CmdRateAuto starts at 20 Hz
+	for (int i = 0; i < 200; i++) {        // 3.2 s of an uplink that never queues
+		n.world.ents[10].vals[0] = i;
+		n.tick();
+	}
+	CHECK(c.uplink().interval_ms() < 50);  // so it climbed
+	c.reset();
+	CHECK(c.uplink().interval_ms() == 50 && c.auto_rate() && c.update_rate_granted() == -1);
+	c.set_auto_rate(false);
+	c.set_auto_command_rate(false, 60.0);
+	CHECK(c.uplink().rate() == 5000 && c.uplink().interval_ms() == 50);
+	printf("  the link settings and the automatic picks reach the uplink: ok\n");
 }
 
 // A fresh ack goes on its own while the client is idle, and waits for the next command packet while
@@ -975,7 +996,7 @@ static void test_ack_rides_a_flowing_command_stream() {
 	CHECK(!p.client.uplink_due(n.now));
 
 	CommandSender &up = p.client.uplink();
-	up.set_interval_ms(50);
+	p.client.set_command_rate(20.0);
 	const uint8_t cmd[1] = { 1 };
 	up.push(1, cmd, sizeof(cmd), n.now);
 	n.send_uplink(p); // the interval starts
@@ -1114,6 +1135,7 @@ int main() {
 	test_arrival_stats_count_only_real_loss();
 	test_uplink_report_rides_the_header();
 	test_ack_rides_a_flowing_command_stream();
+	test_link_settings_reach_the_uplink();
 	test_messages_ride_the_snapshot_in_order();
 	test_messages_survive_a_lost_snapshot();
 	printf("%d checks passed\n", checks);

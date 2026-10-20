@@ -6,26 +6,11 @@
 
 namespace goldnet {
 
-// Snapshot wire-protocol version, written as the first byte of every snapshot. Bump on any
-// wire-format change so a client talking to a mismatched build fails loudly (one clear warning +
-// dropped snapshot) instead of misparsing every packet into a flood of decode errors. A single
-// byte is plenty — this only has to distinguish "same build" from "not", not identify goldnet's
-// framing (the packet already arrives on goldnet's own channel, which is identification enough).
-// v3: changed-field mask is a uvarint (was a fixed u32); magic shrank from a 4-byte "GNS"+version
-// tag to this 1-byte version; empty snapshots (nothing changed/spawned/despawned/left) are no
-// longer sent at all.
-// v4: two new self-describing value tags, TAG_ANGLE8 and TAG_TIME_DELTA — an old decoder seeing
-// either would fall through to the opaque-value default and misparse the stream, so this must bump
-// even though nothing about the existing tags changed.
-// v5: the header carries the client's command ack (see uplink.h), and the client's snapshot ack
-// rides its uplink packet instead of travelling alone.
-// v6: GoldSrc's netchan (netchan.h): both packets carry a reliable block and a datagram after the
-// header, and the uplink packet gained a seq of its own and the newest snapshot received.
-// v7: the uplink packet carries its send time and the client's rate; the snapshot header carries the
-// server's measure of the client's uplink (auto_rate.h).
-// v8: the uplink packet carries the client's update rate; the snapshot header carries the rate the
-// server grants it.
-static const uint8_t SNAPSHOT_VERSION = 8;
+// Wire-protocol version, the first byte of every snapshot and uplink packet. Bump on any wire-format
+// change, so a mismatched build fails loudly (one warning, packets dropped) instead of misparsing
+// every packet. One byte only has to tell "same build" from "not": the packet already arrives on
+// goldnet's own channel.
+static const uint8_t WIRE_VERSION = 8;
 
 // Frames of history kept per peer (server) and received (client). A power of two: slots are
 // indexed by seq & (RING - 1). ~1s at 30 Hz — covers ack RTT + loss.

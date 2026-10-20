@@ -183,8 +183,6 @@ struct ClientCore {
 			clock_offset += (off - clock_offset) * 0.01; // drift and route changes, slowly
 		}
 	}
-	void uplink_report(uint32_t, uint32_t) {}
-	void update_rate(uint32_t) {}
 	void message(const uint8_t *data, size_t size, bool) {
 		if (size >= 5 && data[0] == MSG_YOU) {
 			my_id = get_u32_le(data + 1);
@@ -287,8 +285,8 @@ struct ClientCore {
 
 	void new_session() {
 		client.reset();
-		client.uplink().set_update_rate(30);
-		client.uplink().set_rate(40000);
+		client.set_update_rate(30);
+		client.set_rate(40000);
 		acked = 0;
 		for (auto &kv : ents) {
 			if (kv.second.proxy) {

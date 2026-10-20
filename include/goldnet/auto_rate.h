@@ -9,6 +9,8 @@
 // snapshot header. Both sides react the way TCP finds a link's capacity: a sharp cut while it queues,
 // a slow climb while it doesn't.
 //
+#include "goldnet/protocol.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -113,8 +115,7 @@ public:
 	static constexpr double START = 0.9;        // first limit, as a fraction of what's arriving
 	static constexpr double CUT = 0.8;
 	static constexpr double CLIMB = 1.1;
-	static constexpr int MIN_RATE = 1000;
-	static constexpr int MAX_RATE = 1000000;
+	static constexpr int MAX_RATE = 1000000; // the floor is goldnet's MIN_RATE
 	static constexpr double LOSS_HIGH = 0.25;   // share of snapshots lost (while unlimited) that means overflow
 	static constexpr double SMOOTHING = 0.1;
 
@@ -135,7 +136,7 @@ public:
 		}
 		if (smoothed_ > HIGH_MS || (rate_ == 0 && p_loss > LOSS_HIGH)) {
 			const int cut = rate_ == 0 ? (int)(p_delivered_bps * START) : (int)(rate_ * CUT);
-			rate_ = std::max(MIN_RATE, cut);
+			rate_ = std::max((int)MIN_RATE, cut);
 			hold_until_ = p_now + HOLD_MS;
 			calm_since_ = p_now;
 		} else if (smoothed_ < LOW_MS) {
@@ -179,9 +180,9 @@ public:
 	static constexpr double DRAIN_MIN = 0.5;       // a cut's share of the arrival rate: never under this...
 	static constexpr double DRAIN_MAX = 0.9;       // ...nor over this
 	static constexpr double STEP = 5.0;
-	static constexpr double START_RATE = 20.0;     // a modem's uplink takes about this much
+	static constexpr double START_HZ = 20.0;       // a modem's uplink takes about this much
 	static constexpr uint32_t SLOW_START_MS = 1000; // the calm a step takes until the first cut
-	static constexpr double MIN_RATE = 10.0;
+	static constexpr double MIN_HZ = 10.0;
 	static constexpr double SMOOTHING = 0.1;       // per report
 
 	// One report of the uplink lag and of our packets arriving per second (0 = not known yet);
@@ -202,7 +203,7 @@ public:
 				// Sending at f of capacity drains (1 - f) ms of backlog per ms.
 				cut = std::min(rate_, p_arriving) * std::clamp(1.0 - p_lag_ms / HOLD_MS, DRAIN_MIN, DRAIN_MAX);
 			}
-			rate_ = std::max(MIN_RATE, cut);
+			rate_ = std::max(MIN_HZ, cut);
 			cut_ = true;
 			hold_until_ = p_now + HOLD_MS;
 			calm_since_ = p_now;
@@ -220,7 +221,7 @@ public:
 	double rate() const { return rate_; }
 
 private:
-	double rate_ = START_RATE;
+	double rate_ = START_HZ;
 	bool cut_ = false; // the uplink has queued: climb slowly from now on
 	double smoothed_ = 0.0;
 	uint32_t hold_until_ = 0;

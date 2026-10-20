@@ -56,7 +56,7 @@ the datagram. A message is `uvarint target` and then:
 One per peer per send, server to client.
 
 ```
-u8   version        SNAPSHOT_VERSION = 8
+u8   version        WIRE_VERSION = 8
 u16  seq            this frame's number for this peer
 u16  base_seq       the frame this one is a delta against; 0 = full state
 u32  server_time    the server's clock at send, ms
@@ -122,7 +122,7 @@ Angles take NaN as 0. `TIME_DELTA` applies only to integer ms timestamps; the se
 to the type's own tag for anything else.
 
 A decoder reads any tag it doesn't recognise as `OPAQUE`, so a new tag is a wire change: it bumps
-`SNAPSHOT_VERSION`.
+`WIRE_VERSION`.
 
 ## Ack
 
@@ -190,7 +190,7 @@ is a reliable channel's: each command reaches the server's host once, in the ord
 across all of a client's streams. It is kept over the unreliable link the Quake way, by repetition.
 
 ```
-u8   version        SNAPSHOT_VERSION
+u8   version        WIRE_VERSION
 u16  seq            this packet's, counting up from 1 and skipping 0 on the wrap
 u16  snapshot_ack   the newest committed snapshot; 0 = none
 u16  send_time      the client's clock at send, ms, low 16 bits
@@ -303,7 +303,7 @@ built against whichever frame the peer acks.
 
 For each snapshot:
 
-1. **Version.** Not `SNAPSHOT_VERSION` → drop it (and warn once per session).
+1. **Version.** Not `WIRE_VERSION` → drop it (and warn once per session).
 2. **Order.** `seq` not newer than the last committed frame → drop it.
 3. **Clock.** Surface `server_time` and `command_ack` — even if the next step drops the snapshot.
 4. **Baseline.** If `base_seq` ≠ 0 and that frame isn't in the ring, re-ack the last committed

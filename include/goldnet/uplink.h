@@ -27,7 +27,7 @@
 // client's CmdRateAuto reads it.
 //
 // Uplink packet:
-//   u8   version          SNAPSHOT_VERSION
+//   u8   version          WIRE_VERSION
 //   u16  seq              this packet's, counting up from 1 and skipping 0 like a snapshot's
 //   u16  snapshot_ack     the newest snapshot the client committed; 0 = none
 //   u16  send_time        the client's clock at send, ms, low 16 bits
@@ -107,7 +107,7 @@ inline bool get_byte_delta(Reader &r, const std::vector<uint8_t> *p_base, std::v
 }
 
 // The client end. Client::uplink() is the one a client uses; Client drives on_ack, on_channel_ack
-// and write itself.
+// and write itself, and sets the rate, update rate and interval from its own (Client::set_rate & co).
 class CommandSender {
 public:
 	// Queue one command. Returns its seq.
@@ -253,7 +253,7 @@ public:
 			sent.push_back(i);
 		}
 
-		r_out.put_u8(SNAPSHOT_VERSION);
+		r_out.put_u8(WIRE_VERSION);
 		r_out.put_u16(seq);
 		r_out.put_u16(p_snapshot_ack);
 		r_out.put_u16((uint16_t)p_now);
@@ -439,7 +439,7 @@ bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_si
 	if (r.failed()) {
 		return false;
 	}
-	if (version != SNAPSHOT_VERSION) {
+	if (version != WIRE_VERSION) {
 		Peer &p = peers_[p_peer];
 		if (!p.warned) {
 			p.warned = true;

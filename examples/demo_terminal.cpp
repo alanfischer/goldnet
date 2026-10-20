@@ -385,8 +385,6 @@ struct ClientApp {
 	// The host interface Client::apply() calls back into.
 	void protocol_mismatch() { fprintf(stderr, "[client] server speaks a different snapshot version\n"); }
 	void server_time(uint32_t ms) { server_ms = ms; }
-	void uplink_report(uint32_t, uint32_t) {}
-	void update_rate(uint32_t) {}
 	void message(const uint8_t *, size_t, bool) {}
 	bool spawn(uint32_t net_id, uint32_t, const uint8_t *data, size_t size) {
 		ents[net_id] = Ent{ size ? (char)data[0] : '?', std::vector<Value>(BALL_SLOTS) };
@@ -441,7 +439,7 @@ struct ClientApp {
 
 	void new_session() {
 		client.reset();
-		client.uplink().set_rate(rate);
+		client.set_rate(rate);
 		next_command = 0;
 		ents.clear();
 		ents[SCOREBOARD_ID] = Ent{ '#', std::vector<Value>(2) };
