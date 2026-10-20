@@ -4,17 +4,22 @@
 // server diffed it against, apply spawns / despawns / leaves / changed slots through the host, and
 // ack. Engine-agnostic, like Server.
 //
+// The uplink. Everything the client sends rides its uplink packets: its commands and messages
+// (uplink(), see uplink.h), the snapshot ack, what it has of the server's channel, and the rates it
+// asks for. Send one whenever uplink_due() says so:
+//
+//   if (client.uplink_due(now)) { Writer w; client.write_uplink(now, w); /* send w */ }
+//
+// A fresh ack makes a packet due on its own, unless commands are flowing: then it rides the next
+// command packet, which comes within the command interval.
+//
 // The host passed to apply() provides:
 //   void protocol_mismatch()                       a different build is talking to us (once per session)
 //   void server_time(uint32_t ms)                  every in-order snapshot's header clock
-//   void command_ack(uint16_t seq)                 and its command ack (CommandSender::on_ack); 0 = none
 //   void uplink_report(uint32_t lag_ms, uint32_t pps)   and the server's measure of our uplink
 //                                                  (CmdRateAuto)
 //   void update_rate(uint32_t hz)                  and the snapshots/sec the server grants us; 0 =
 //                                                  every tick, at a rate it doesn't know
-//   void channel_ack(const ChannelAck &ack)       and what the server has of our uplink's channel
-//                                                  (CommandSender::on_channel_ack)
-//   void send_ack(uint16_t seq)                    the snapshot ack for the next uplink packet
 //   void message(const uint8_t *data, size_t size, bool reliable)   one netchan message (netchan.h)
 //   bool spawn(uint32_t net_id, uint32_t spawner_net_id, const uint8_t *data, size_t size)
 //        create it; false = can't yet: the frame isn't acked, so the spawn is offered again
@@ -36,6 +41,7 @@
 #include "goldnet/codec.h"
 #include "goldnet/netchan.h"
 #include "goldnet/protocol.h"
+#include "goldnet/uplink.h"
 
 #include <unordered_map>
 #include <unordered_set>
@@ -54,6 +60,8 @@ public:
 		int despawns = 0;
 		int changed = 0;
 		bool committed = false;
+		uint16_t ack = 0;         // the snapshot ack it queued for the uplink; 0 = none
+		uint16_t command_ack = 0; // the header's: the newest command the server has; 0 = none
 	};
 
 	// Snapshots that arrived, and seqs skipped on the way to them, this session. The server
@@ -78,14 +86,32 @@ public:
 		has_ = false;
 		defer_streak_ = 0;
 		chan_ = ChannelReceiver();
+		uplink_.reset();
+		ack_ = 0;
+		news_ = false;
 	}
 
-	// For the uplink: what this end has received of the server's channel.
-	const ChannelAckSource &channel_ack() const { return chan_.ack_source(); }
-
-	// p_now: the host's clock, the same one it writes its uplink packets by (see channel_ack).
+	// p_now: the host's clock, the same one it writes its uplink packets by.
 	template <class Host>
 	ApplyInfo apply(const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now);
+
+	// The commands, messages, rate, update rate and command interval this client sends (uplink.h).
+	CommandSender &uplink() { return uplink_; }
+	const CommandSender &uplink() const { return uplink_; }
+
+	// Whether an uplink packet should go now: commands or messages due, or news the server is waiting on.
+	bool uplink_due(uint32_t p_now) const {
+		if (uplink_.due(p_now)) {
+			return true;
+		}
+		return news_ && uplink_.idle_ms(p_now) >= uplink_.interval_ms() + ACK_WAIT_SLACK_MS;
+	}
+
+	// Build the next uplink packet.
+	void write_uplink(uint32_t p_now, Writer &r_out) {
+		uplink_.write(p_now, ack_, chan_.ack_source(), r_out);
+		news_ = false;
+	}
 
 private:
 	// A frame is { net_id -> its slot values, in slot order }.
@@ -107,7 +133,17 @@ private:
 	ArrivalStats arrivals_;
 	uint16_t arrived_last_ = 0; // the newest seq seen; 0 = none yet
 	ChannelReceiver chan_;
+	CommandSender uplink_;
+	uint16_t ack_ = 0;    // the snapshot ack the next uplink packet carries; 0 = none
+	bool news_ = false;   // a snapshot arrived since the last uplink packet: an ack, or channel news
+	// Commands count as flowing while one was pushed within the command interval plus this.
+	static const uint32_t ACK_WAIT_SLACK_MS = 100;
 	void count_arrival(uint16_t p_seq);
+	void queue_ack(uint16_t p_seq, ApplyInfo &r_info) {
+		ack_ = p_seq;
+		news_ = true;
+		r_info.ack = p_seq;
+	}
 	static const uint32_t MAX_DEFER_STREAK = RING; // ~1s at 30 Hz before giving up on a warmup entity
 };
 
@@ -149,7 +185,8 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	if ((has_ && !seq_newer(seq, last_seq_)) || !chan_.accept(seq)) {
 		return info;
 	}
-	p_host.channel_ack(chan.ack);
+	uplink_.on_channel_ack(chan.ack, p_now);
+	news_ = true;
 	std::vector<std::vector<uint8_t>> reliable;
 	std::vector<std::vector<uint8_t>> unreliable;
 	if (!chan.take(chan_, p_now, reliable, unreliable)) {
@@ -167,7 +204,8 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	// snapshot's time is <= one already fed) but before the baseline-resolution drop below, so a
 	// forward snapshot we can't reconstruct for state still contributes its valid clock sample.
 	p_host.server_time(server_time);
-	p_host.command_ack(command_ack);
+	uplink_.on_ack(command_ack);
+	info.command_ack = command_ack;
 	p_host.uplink_report(uplink_lag_ms, uplink_pps);
 	p_host.update_rate(update_rate);
 
@@ -184,7 +222,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 			deliver(reliable, true);
 			deliver(unreliable, false);
 			if (has_) {
-				p_host.send_ack(last_seq_);
+				queue_ack(last_seq_, info);
 			}
 			return info;
 		}
@@ -326,7 +364,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	if ((spawn_refused || (defer_ack && has_)) && defer_streak_ < MAX_DEFER_STREAK) {
 		defer_streak_++;
 		if (has_) {
-			p_host.send_ack(last_seq_);
+			queue_ack(last_seq_, info);
 		}
 		return info;
 	}
@@ -338,7 +376,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	frame_seq_[slot] = seq;
 	last_seq_ = seq;
 	has_ = true;
-	p_host.send_ack(seq);
+	queue_ack(seq, info);
 	info.committed = true;
 	return info;
 }

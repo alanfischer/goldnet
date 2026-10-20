@@ -26,7 +26,7 @@ drained but stop adding bits once the type is full.
 ## Carriage
 
 The core hands bytes to its host and leaves delivery to it: `send(peer, packet)` on the server,
-`CommandSender::write` on the client. The protocol assumes an **unreliable datagram** link, where packets
+`Client::write_uplink` on the client. The protocol assumes an **unreliable datagram** link, where packets
 may be lost, duplicated or reordered, and it does its own recovery. A reliable link works, but the
 recovery is then wasted and a loss stalls everything queued behind it.
 

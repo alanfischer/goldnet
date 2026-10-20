@@ -172,11 +172,11 @@ struct View {
 			static const uint32_t rates[] = { 10, 20, 30, 60 };
 			uint32_t next = rates[0];
 			for (int i = 0; i < 4; i++) {
-				if (rates[i] == core.commands.update_rate()) {
+				if (rates[i] == core.client.uplink().update_rate()) {
 					next = rates[(i + 1) % 4];
 				}
 			}
-			core.commands.set_update_rate(next);
+			core.client.uplink().set_update_rate(next);
 		}
 		if (mouse_captured) {
 			const Vector2 d = GetMouseDelta();
@@ -294,7 +294,7 @@ struct View {
 		text(line, 16, y, 16, LIGHTGRAY);
 		y += 20;
 		snprintf(line, sizeof(line), "snapshots %d/s (asked %u, U)   in %.1f KB/s   out %.1f KB/s", s.snapshots,
-				core.commands.update_rate(), s.bytes_in / 1024.0, s.bytes_out / 1024.0);
+				core.client.uplink().update_rate(), s.bytes_in / 1024.0, s.bytes_out / 1024.0);
 		text(line, 16, y, 16, LIGHTGRAY);
 		y += 20;
 		snprintf(line, sizeof(line), "prediction %s (P)   interpolation %s, %u ms (I)   ghosts %s (G)",

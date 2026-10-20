@@ -42,11 +42,12 @@
 //             uvarint len, then ceil(len / 8) mask bytes (bit i: byte i differs from the base),
 //             then the differing bytes
 //
-// A server normally takes each packet with Server::receive_uplink, which calls receive() and does
-// the snapshot_ack and channel_ack parts itself. The host passed to receive() directly provides:
+// A client's Client owns its CommandSender (Client::uplink) and a server's Server owns its
+// CommandReceiver (Server::receive_uplink), and each passes the acks between the two directions
+// itself. Used on their own, the host passed to receive() provides:
 //   void protocol_mismatch(int32_t peer)            a different build is talking to us (once per peer)
-//   void snapshot_ack(int32_t peer, uint16_t seq)   pass to Server::on_ack
-//   void channel_ack(int32_t peer, const ChannelAck &ack)   pass to Server::on_channel_ack
+//   void snapshot_ack(int32_t peer, uint16_t seq)   the newest snapshot the peer committed
+//   void channel_ack(int32_t peer, const ChannelAck &ack)   what it has received of the server's channel
 //   void command(int32_t peer, uint32_t stream_id, const uint8_t *data, size_t size)
 //   void message(int32_t peer, const uint8_t *data, size_t size, bool reliable)
 //
@@ -105,7 +106,8 @@ inline bool get_byte_delta(Reader &r, const std::vector<uint8_t> *p_base, std::v
 	return !r.failed();
 }
 
-// The client end.
+// The client end. Client::uplink() is the one a client uses; Client drives on_ack, on_channel_ack
+// and write itself.
 class CommandSender {
 public:
 	// Queue one command. Returns its seq.
@@ -284,8 +286,15 @@ public:
 	uint32_t dropped() const { return dropped_; }
 	uint32_t rtt_ms() const { return srtt_ms_; }
 
-	// A fresh session: the server knows nothing of the old one's seqs.
-	void reset() { *this = CommandSender(); }
+	// A fresh session: the server knows nothing of the old one's seqs. The settings stay.
+	void reset() {
+		CommandSender fresh;
+		fresh.interval_ms_ = interval_ms_;
+		fresh.rate_ = rate_;
+		fresh.update_rate_ = update_rate_;
+		fresh.backup_ = backup_;
+		*this = std::move(fresh);
+	}
 
 private:
 	struct Cmd {
@@ -346,14 +355,13 @@ public:
 		return it == peers_.end() || !it->second.delivered ? 0 : command_seq_prev(it->second.next);
 	}
 
-	// What the server has received of p_peer's channel, for Server::set_uplink_ack.
+	// What the server has received of p_peer's channel, for its next snapshot header.
 	ChannelAckSource channel_ack(int32_t p_peer) const {
 		auto it = peers_.find(p_peer);
 		return it == peers_.end() ? ChannelAckSource() : it->second.chan.ack_source();
 	}
 
-	// Whether p_peer should hear from the server though its command ack hasn't moved (Server's
-	// set_command_ack): it sent commands the server already had, so it lacks the ack, or the server is
+	// Whether p_peer should hear from the server though its command ack hasn't moved: it sent commands the server already had, so it lacks the ack, or the server is
 	// holding commands behind a lost one and the peer needs to see which packets arrived to send it
 	// again (CommandSender::proven_lost). Cleared by the call.
 	bool take_news(int32_t p_peer) {
@@ -366,7 +374,7 @@ public:
 	}
 
 	// How far behind its best p_peer's uplink is arriving, ms, and its packets arriving per second
-	// (auto_rate.h): for the peer's snapshot header (Server::set_uplink_report).
+	// (auto_rate.h): for the peer's snapshot header.
 	uint32_t uplink_lag_ms(int32_t p_peer) const {
 		auto it = peers_.find(p_peer);
 		return it == peers_.end() ? 0 : it->second.lag_ms;
