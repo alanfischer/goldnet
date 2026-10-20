@@ -10,7 +10,7 @@ namespace goldnet {
 // change, so a mismatched build fails loudly (one warning, packets dropped) instead of misparsing
 // every packet. One byte only has to tell "same build" from "not": the packet already arrives on
 // goldnet's own channel.
-static const uint8_t WIRE_VERSION = 8;
+static const uint8_t WIRE_VERSION = 9;
 
 // Frames of history kept per peer (server) and received (client). A power of two: slots are
 // indexed by seq & (RING - 1). ~1s at 30 Hz — covers ack RTT + loss.

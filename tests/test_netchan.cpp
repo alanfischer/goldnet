@@ -300,7 +300,11 @@ struct UpHost {
 	void protocol_mismatch(int32_t) {}
 	void snapshot_ack(int32_t, uint16_t) {}
 	void channel_ack(int32_t, const ChannelAck &) {}
-	void command(int32_t, uint32_t, const uint8_t *data, size_t) { log.push_back("c" + std::to_string(data[0])); }
+	const Schema *command_schema(int32_t, uint32_t) {
+		static const Schema bytes_only{ FIELD_BYTES };
+		return &bytes_only;
+	}
+	void command(int32_t, uint32_t, const Command &c) { log.push_back("c" + std::to_string(c[0].bytes[0])); }
 	void message(int32_t, const uint8_t *data, size_t, bool reliable) {
 		log.push_back((reliable ? "r" : "u") + std::to_string(data[0]));
 	}

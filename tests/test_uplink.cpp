@@ -6,6 +6,8 @@
 
 #include "goldnet/uplink.h"
 
+#include <cmath>
+
 #include <set>
 
 using namespace goldnet;
@@ -23,9 +25,11 @@ struct RecvHost {
 	void snapshot_ack(int32_t, uint16_t seq) { snapshot_acks.push_back(seq); }
 	void channel_ack(int32_t, const ChannelAck &) {}
 	void message(int32_t, const uint8_t *, size_t, bool) {}
-	void command(int32_t, uint32_t stream, const uint8_t *data, size_t size) {
-		got.push_back({ stream, std::vector<uint8_t>(data, data + size) });
+	const Schema *command_schema(int32_t, uint32_t) {
+		static const Schema bytes_only{ FIELD_BYTES };
+		return &bytes_only;
 	}
+	void command(int32_t, uint32_t stream, const Command &c) { got.push_back({ stream, c[0].bytes }); }
 };
 
 // A command whose bytes say which one it is, so order and identity are checkable.
@@ -202,14 +206,71 @@ static void test_repeated_bytes_cost_their_changes() {
 	Writer w;
 	s.write(10, 0, ChannelAckSource(), w);
 	// Header 24 (incl. the send time, zero rates, an empty channel part, one stream and first_seq),
-	// then the first command against zeros: len 1, mask 4, 32 bytes. Then an identical one: gap 1,
-	// len 1, mask 4. Then one changed byte: gap, len, mask, 1.
-	CHECK(w.size() == 24 + 37 + 6 + 7);
+	// then the first command against zeros: field mask 1, len 1, byte mask 4, 32 bytes. Then an
+	// identical one: gap 1, field mask 1. Then one changed byte: gap, field mask, len, byte mask, 1.
+	CHECK(w.size() == 24 + 38 + 2 + 8);
 	CommandReceiver r;
 	RecvHost h;
 	CHECK(r.receive(2, w.data(), w.size(), h, 0));
 	CHECK(h.got.size() == 3 && h.got[0].bytes == a && h.got[1].bytes == a && h.got[2].bytes == b);
 	printf("  a command repeating the last costs its mask and changed bytes: ok\n");
+}
+
+static Command typed_cmd(int64_t n, int64_t yaw, float f, bool b) {
+	Command c(4);
+	c[0].i = n;
+	c[1].i = yaw;
+	c[2].f = f;
+	c[3].i = b ? 1 : 0;
+	return c;
+}
+
+static void test_typed_fields_cost_their_changes() {
+	const Schema schema{ FIELD_INT, FIELD_INT, FIELD_FLOAT, FIELD_BOOL };
+	CommandSender s;
+	s.set_schema(1, schema);
+	s.push(1, typed_cmd(5000, -300, 0.5f, true), 10);
+	s.push(1, typed_cmd(5001, -300, 0.5f, true), 10);
+	s.push(1, typed_cmd(5002, -290, 0.5f, false), 10);
+	s.push(1, typed_cmd(5003, -290, -0.0f, false), 10);
+	Writer w;
+	s.write(10, 0, ChannelAckSource(), w);
+	// The first against zeros: mask 1, 5000 zig-zagged 2, -300 zig-zagged 2, f32 4, the bool's bit 0.
+	// Then each: gap 1 and mask 1, plus a +1 step 1; +1 and a +10 turn 1 each with the flip free;
+	// +1 and -0.0, which differs bitwise from 0.5 and travels whole, 4.
+	CHECK(w.size() == 24 + 9 + 3 + 4 + 7);
+	CommandReceiver r;
+	struct Host : RecvHost {
+		std::vector<Command> cmds;
+		const Schema *schema = nullptr;
+		const Schema *command_schema(int32_t, uint32_t) { return schema; }
+		void command(int32_t, uint32_t, const Command &c) { cmds.push_back(c); }
+	} h;
+	h.schema = &schema;
+	CHECK(r.receive(2, w.data(), w.size(), h, 0));
+	CHECK(h.cmds.size() == 4);
+	CHECK(h.cmds[0][0].i == 5000 && h.cmds[0][1].i == -300 && h.cmds[0][2].f == 0.5f && h.cmds[0][3].i == 1);
+	CHECK(h.cmds[2][0].i == 5002 && h.cmds[2][1].i == -290 && h.cmds[2][3].i == 0);
+	CHECK(h.cmds[3][0].i == 5003 && std::signbit(h.cmds[3][2].f) && h.cmds[3][2].f == 0.0f);
+	printf("  typed fields cost their changes: an int its step, a bool nothing: ok\n");
+}
+
+static void test_unknown_schema_drops_commands_not_packet() {
+	CommandSender s;
+	s.set_schema(1, Schema{ FIELD_INT });
+	Command c(1);
+	c[0].i = 7;
+	s.push(1, c, 10);
+	Writer w;
+	s.write(10, 321, ChannelAckSource(), w);
+	CommandReceiver r;
+	struct Host : RecvHost {
+		const Schema *command_schema(int32_t, uint32_t) { return nullptr; }
+	} h;
+	CHECK(r.receive(2, w.data(), w.size(), h, 0));
+	CHECK(h.got.empty() && r.ack(2) == 0);
+	CHECK(h.snapshot_acks == std::vector<uint16_t>{ 321 });
+	printf("  a stream the host doesn't know drops the commands, not the packet's acks: ok\n");
 }
 
 static void test_snapshot_ack_rides_along() {
@@ -467,6 +528,8 @@ int main() {
 	test_streams_share_one_order();
 	test_seq_wraps();
 	test_repeated_bytes_cost_their_changes();
+	test_typed_fields_cost_their_changes();
+	test_unknown_schema_drops_commands_not_packet();
 	test_snapshot_ack_rides_along();
 	test_malformed_input();
 	test_rtt_is_measured_through_backups();

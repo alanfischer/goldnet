@@ -154,9 +154,11 @@ struct TestClientHost {
 struct TestUplinkHost {
 	std::vector<std::vector<uint8_t>> commands;
 	void protocol_mismatch(int32_t) {}
-	void command(int32_t, uint32_t, const uint8_t *data, size_t size) {
-		commands.push_back(std::vector<uint8_t>(data, data + size));
+	const Schema *command_schema(int32_t, uint32_t) {
+		static const Schema bytes_only{ FIELD_BYTES };
+		return &bytes_only;
 	}
+	void command(int32_t, uint32_t, const Command &c) { commands.push_back(c[0].bytes); }
 	void message(int32_t, const uint8_t *, size_t, bool) {}
 };
 

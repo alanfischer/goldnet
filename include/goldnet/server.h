@@ -46,7 +46,8 @@
 // host, and the server takes the rest, the acks and what the client asks for. The host passed to it
 // provides:
 //   void protocol_mismatch(int32_t peer)            a different build is talking to us (once per peer)
-//   void command(int32_t peer, uint32_t stream_id, const uint8_t *data, size_t size)
+//   const Schema *command_schema(int32_t peer, uint32_t stream_id)   the stream's (uplink.h), or null
+//   void command(int32_t peer, uint32_t stream_id, const Command &cmd)
 //   void message(int32_t peer, const uint8_t *data, size_t size, bool reliable)
 //
 // Messages. Each peer's snapshots carry its end of a GoldSrc netchan (netchan.h): queue_reliable and
@@ -511,7 +512,8 @@ bool Server<V, X>::receive_uplink(int32_t p_peer, const uint8_t *p_data, size_t 
 		void protocol_mismatch(int32_t p) { host.protocol_mismatch(p); }
 		void snapshot_ack(int32_t p, uint16_t seq) { server.on_ack(p, seq, now); }
 		void channel_ack(int32_t p, const ChannelAck &a) { server.on_channel_ack(p, a); }
-		void command(int32_t p, uint32_t stream, const uint8_t *d, size_t n) { host.command(p, stream, d, n); }
+		const Schema *command_schema(int32_t p, uint32_t stream) { return host.command_schema(p, stream); }
+		void command(int32_t p, uint32_t stream, const Command &c) { host.command(p, stream, c); }
 		void message(int32_t p, const uint8_t *d, size_t n, bool reliable) { host.message(p, d, n, reliable); }
 	};
 	Router router{ *this, p_host, p_now };
