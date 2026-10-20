@@ -153,11 +153,9 @@ struct ServerApp {
 		}
 	}
 
-	// --- goldnet's host interface (CommandReceiver::receive) ---
+	// --- goldnet's host interface (Server::receive_uplink) ---
 
 	void protocol_mismatch(int32_t peer) { fprintf(stderr, "[server] peer %d speaks a different version\n", peer); }
-	void snapshot_ack(int32_t peer, uint16_t seq) { server.on_ack(peer, seq, now_ms()); }
-	void channel_ack(int32_t peer, const ChannelAck &ack) { server.on_channel_ack(peer, ack); }
 	void message(int32_t, const uint8_t *, size_t, bool) {}
 	void command(int32_t peer, uint32_t, const uint8_t *data, size_t size) {
 		auto it = players.find(peers[peer].player);
@@ -484,12 +482,7 @@ struct ServerApp {
 			} else if (buf[0] == 'U' && it != by_addr.end()) {
 				const int32_t peer = it->second;
 				peers[peer].last_heard = now;
-				receiver.receive(peer, buf + 1, (size_t)n - 1, *this, now_ms());
-				server.set_command_ack(peer, receiver.ack(peer), receiver.take_news(peer));
-				server.set_uplink_ack(peer, receiver.channel_ack(peer));
-				server.set_uplink_report(peer, receiver.uplink_lag_ms(peer), receiver.uplink_pps(peer));
-				server.set_peer_rate(peer, receiver.rate(peer));
-				server.set_peer_update_rate(peer, receiver.update_rate(peer));
+				server.receive_uplink(peer, receiver, buf + 1, (size_t)n - 1, *this, now_ms());
 			}
 			len = sizeof(from);
 		}
