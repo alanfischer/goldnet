@@ -49,7 +49,8 @@ optional per-entity priority, so nothing starves.
 matters, so it can't converge the way state does. `CommandSender` / `CommandReceiver` deliver each
 command once and in order, the way Quake did, without a reliable channel underneath: every uplink
 packet carries the commands not sent yet, two backups, and any unacked one older than a round
-trip and a half. Each command is delta-coded bytewise against the one before it. The server's
+trip and a half. Each command is a row of typed fields, delta-coded field by field against the one
+before it the way GoldSrc's `delta.lst` coded a usercmd. The server's
 command ack rides each snapshot header, and the client's snapshot ack rides each uplink packet.
 
 **The netchan.** Both directions also carry a GoldSrc netchan: a reliable stream (one block in

@@ -213,7 +213,13 @@ struct ServerApp {
 	// The host interface Server::receive_uplink() calls back into.
 	void protocol_mismatch(int32_t peer) { fprintf(stderr, "[server] peer %d speaks a different version\n", peer); }
 	void message(int32_t, const uint8_t *, size_t, bool) {}
-	void command(int32_t peer, uint32_t, const uint8_t *data, size_t size) {
+	const Schema *command_schema(int32_t, uint32_t) {
+		static const Schema bytes_only{ FIELD_BYTES };
+		return &bytes_only;
+	}
+	void command(int32_t peer, uint32_t, const Command &c) {
+		const uint8_t *data = c[0].bytes.data();
+		const size_t size = c[0].bytes.size();
 		PeerInfo &p = peers[peer];
 		const uint32_t n = size >= 4 ? data[0] | (data[1] << 8) | (data[2] << 16) | ((uint32_t)data[3] << 24) : 0;
 		if (p.commands + p.out_of_order > 0 && n != p.expect) {

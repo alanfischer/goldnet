@@ -184,8 +184,9 @@ and the datagram's after them, as GoldSrc ran a string command before a move.
 
 ## Uplink
 
-Client to server: the snapshot ack, the channel, and the client's **commands** — opaque byte strings, each
-tagged with a host-chosen `u32` stream id (in Godot, the marked RPC it stands for). The contract
+Client to server: the snapshot ack, the channel, and the client's **commands** — rows of typed fields, each
+tagged with a host-chosen `u32` stream id (in Godot, the marked RPC it stands for). Each stream has a
+schema, its fields' kinds in order, which both ends know without it going on the wire. The contract
 is a reliable channel's: each command reaches the server's host once, in the order it was made,
 across all of a client's streams. It is kept over the unreliable link the Quake way, by repetition.
 
@@ -202,18 +203,23 @@ u8   stream_ct      then stream_ct × u32 stream_id
 u8   cmd_ct         then, if cmd_ct > 0, u16 first_seq and cmd_ct × command, seqs ascending
 ```
 
-**Command** — seq, stream and bytes:
+**Command** — seq, stream and fields:
 
 ```
 uvarint  seq − previous seq − 1      absent for the first, whose seq is first_seq
 u8       stream index                only when stream_ct > 1
-uvarint  len
-ceil(len / 8) bytes                  bit i set: byte i differs from the base
-the differing bytes, in order
+uvarint  mask                        bit i set: field i differs from the base
+each changed field, in order:
+  int    zig-zag varint of (value − base)
+  float  f32, whole
+  bool   nothing: a change is a flip
+  bytes  uvarint len, ceil(len / 8) bytes (bit i set: byte i differs from the base's), the
+         differing bytes in order; bytes past the base's end compare against zero
 ```
 
 The base is the previous command of the same stream in this packet, or zeros for the first
-(Quake's `nullcmd`); bytes past the base's end compare against zero.
+(Quake's `nullcmd`), the way GoldSrc's `delta.lst` coded a usercmd. A server that has no schema for
+a stream in the packet can't parse past it, so it drops the packet's commands and keeps the rest.
 
 Command seqs are per client and count up from 1, skipping 0 on the wrap like snapshot seqs, and
 compare the same way.

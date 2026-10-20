@@ -7,11 +7,12 @@
 // command delivered with none missing before it) rides each snapshot header, and the client's
 // snapshot ack rides each uplink packet, so neither direction needs a packet of its own for acks.
 //
-// A command is opaque bytes, tagged with a stream id the host picks (in Godot, the RPC it stands
-// for). A client's streams share one sequence, so the order holds across them. Each command is
-// delta-coded bytewise against the previous command of its stream in the same packet, the first
-// against zeros (Quake's nullcmd), so one that repeats most of the last costs about its changed
-// bytes.
+// A command is a row of fields, tagged with a stream id the host picks (in Godot, the RPC it stands
+// for). A client's streams share one sequence, so the order holds across them. Each stream has a
+// schema, its fields' kinds in order, which both ends know without it going on the wire. A command
+// is coded field by field against the previous command of its stream in the same packet, the first
+// against zeros (Quake's nullcmd), the way GoldSrc's delta.lst coded a usercmd: a mask of the fields
+// that changed, then each one's change (see FieldKind). One that repeats the last costs a byte.
 //
 // The one way this is weaker than a reliable channel: a command that falls out of the client's
 // COMMAND_RING unacked is given up on. The packet's floor says so, and the server skips past it
@@ -39,8 +40,8 @@
 //   u8   cmd_ct           then, if cmd_ct > 0, u16 first_seq and cmd_ct × command, seqs ascending
 //   command:  uvarint (seq − previous seq − 1), absent for the first
 //             u8 stream index, only when stream_ct > 1
-//             uvarint len, then ceil(len / 8) mask bytes (bit i: byte i differs from the base),
-//             then the differing bytes
+//             uvarint mask (bit i: field i differs from the base), then each changed field's
+//             change in field order (FieldKind)
 //
 // A client's Client owns its CommandSender (Client::uplink) and a server's Server owns its
 // CommandReceiver (Server::receive_uplink), and each passes the acks between the two directions
@@ -48,8 +49,11 @@
 //   void protocol_mismatch(int32_t peer)            a different build is talking to us (once per peer)
 //   void snapshot_ack(int32_t peer, uint16_t seq)   the newest snapshot the peer committed
 //   void channel_ack(int32_t peer, const ChannelAck &ack)   what it has received of the server's channel
-//   void command(int32_t peer, uint32_t stream_id, const uint8_t *data, size_t size)
+//   const Schema *command_schema(int32_t peer, uint32_t stream_id)   the stream's, or null if unknown
+//   void command(int32_t peer, uint32_t stream_id, const Command &cmd)
 //   void message(int32_t peer, const uint8_t *data, size_t size, bool reliable)
+// A packet naming a stream the host has no schema for can't be parsed past it, so its commands are
+// all dropped, and they arrive again once the host knows the stream or the client gives up on them.
 //
 #include "goldnet/auto_rate.h"
 #include "goldnet/buffer.h"
@@ -106,16 +110,123 @@ inline bool get_byte_delta(Reader &r, const std::vector<uint8_t> *p_base, std::v
 	return !r.failed();
 }
 
+// How a command field is coded against the same field of the command before it.
+enum FieldKind : uint8_t {
+	FIELD_INT,   // int64: a zig-zag varint of the difference, so a small step is a byte
+	FIELD_FLOAT, // f32, whole, when it changes
+	FIELD_BOOL,  // a change is a flip, so the mask bit is all of it
+	FIELD_BYTES, // a byte string, bytewise against the last (put_byte_delta)
+};
+using Schema = std::vector<FieldKind>;
+static const int MAX_COMMAND_FIELDS = 32; // the width of the mask
+
+struct Field {
+	int64_t i = 0; // FIELD_INT, and FIELD_BOOL as 0 or 1
+	float f = 0.0f;
+	std::vector<uint8_t> bytes;
+};
+using Command = std::vector<Field>;
+
+inline bool field_equal(FieldKind p_kind, const Field &a, const Field &b) {
+	switch (p_kind) {
+		case FIELD_INT:
+			return a.i == b.i;
+		case FIELD_FLOAT:
+			return memcmp(&a.f, &b.f, sizeof(float)) == 0; // bitwise, so -0 and NaN still say "changed"
+		case FIELD_BOOL:
+			return (a.i != 0) == (b.i != 0);
+		case FIELD_BYTES:
+			return a.bytes == b.bytes;
+	}
+	return false;
+}
+
+// One command against its base (null = zeros). p_cur has one field per schema entry.
+inline void put_command(Writer &w, const Schema &p_schema, const Command *p_base, const Command &p_cur) {
+	static const Field zero;
+	uint32_t mask = 0;
+	for (size_t k = 0; k < p_schema.size(); k++) {
+		if (!field_equal(p_schema[k], p_base ? (*p_base)[k] : zero, p_cur[k])) {
+			mask |= 1u << k;
+		}
+	}
+	put_uvarint(&w, mask);
+	for (size_t k = 0; k < p_schema.size(); k++) {
+		if (!(mask & (1u << k))) {
+			continue;
+		}
+		const Field &base = p_base ? (*p_base)[k] : zero;
+		switch (p_schema[k]) {
+			case FIELD_INT:
+				put_varint(&w, (int64_t)((uint64_t)p_cur[k].i - (uint64_t)base.i));
+				break;
+			case FIELD_FLOAT:
+				w.put_float(p_cur[k].f);
+				break;
+			case FIELD_BOOL:
+				break;
+			case FIELD_BYTES:
+				put_byte_delta(w, p_base ? &base.bytes : nullptr, p_cur[k].bytes);
+				break;
+		}
+	}
+}
+
+inline bool get_command(Reader &r, const Schema &p_schema, const Command *p_base, Command &r_out) {
+	static const Field zero;
+	const uint32_t mask = get_uvarint(&r);
+	if (p_schema.size() < 32 && (mask >> p_schema.size()) != 0) {
+		return false; // a field the schema doesn't have
+	}
+	r_out.assign(p_schema.size(), Field());
+	for (size_t k = 0; k < p_schema.size(); k++) {
+		const Field &base = p_base ? (*p_base)[k] : zero;
+		if (!(mask & (1u << k))) {
+			r_out[k] = base;
+			continue;
+		}
+		switch (p_schema[k]) {
+			case FIELD_INT:
+				r_out[k].i = (int64_t)((uint64_t)base.i + (uint64_t)get_varint(&r));
+				break;
+			case FIELD_FLOAT:
+				r_out[k].f = r.get_float();
+				break;
+			case FIELD_BOOL:
+				r_out[k].i = base.i != 0 ? 0 : 1;
+				break;
+			case FIELD_BYTES:
+				if (!get_byte_delta(r, p_base ? &base.bytes : nullptr, r_out[k].bytes)) {
+					return false;
+				}
+				break;
+		}
+	}
+	return !r.failed();
+}
+
 // The client end. Client::uplink() is the one a client uses; Client drives on_ack, on_channel_ack
 // and write itself, and sets the rate, update rate and interval from its own (Client::set_rate & co).
 class CommandSender {
 public:
-	// Queue one command. Returns its seq.
-	uint16_t push(uint32_t p_stream, const uint8_t *p_data, size_t p_size, uint32_t p_now) {
+	// A stream's field kinds, in order; the server's host must name the same. A stream with none set
+	// is one FIELD_BYTES field. Set it before the stream's first push.
+	void set_schema(uint32_t p_stream, const Schema &p_schema) { schemas_[p_stream] = p_schema; }
+	const Schema &schema(uint32_t p_stream) const {
+		static const Schema bytes_only{ FIELD_BYTES };
+		auto it = schemas_.find(p_stream);
+		return it == schemas_.end() ? bytes_only : it->second;
+	}
+
+	// Queue one command, one field per schema entry (missing ones are zero, extra ones dropped).
+	// Returns its seq.
+	uint16_t push(uint32_t p_stream, Command p_cmd, uint32_t p_now) {
+		const size_t fields = std::min(schema(p_stream).size(), (size_t)MAX_COMMAND_FIELDS);
+		p_cmd.resize(fields);
 		Cmd c;
 		c.seq = next_seq_;
 		c.stream = p_stream;
-		c.bytes.assign(p_data, p_data + p_size);
+		c.fields = std::move(p_cmd);
 		next_seq_ = command_seq_next(next_seq_);
 		ring_.push_back(std::move(c));
 		if (ring_.size() > (size_t)COMMAND_RING) {
@@ -125,6 +236,13 @@ public:
 		last_push_ms_ = p_now;
 		pushed_ = true;
 		return ring_.back().seq;
+	}
+
+	// A command that is one byte string, for a stream with no schema set.
+	uint16_t push(uint32_t p_stream, const uint8_t *p_data, size_t p_size, uint32_t p_now) {
+		Command cmd(1);
+		cmd[0].bytes.assign(p_data, p_data + p_size);
+		return push(p_stream, std::move(cmd), p_now);
 	}
 
 	// The command ack from a snapshot header: everything up to p_seq arrived.
@@ -228,7 +346,7 @@ public:
 
 		const int budget = SAFE_PACKET_BYTES - HEADER_BYTES - 4 * (int)streams.size() - (int)datagram.size() - channel_bytes;
 		Writer body;
-		std::vector<const std::vector<uint8_t> *> prev(streams.size(), nullptr);
+		std::vector<const Command *> prev(streams.size(), nullptr);
 		std::vector<size_t> sent;
 		uint16_t last_seq = 0;
 		for (size_t i : picks) {
@@ -241,14 +359,14 @@ public:
 			if (streams.size() > 1) {
 				w.put_u8((uint8_t)si);
 			}
-			put_byte_delta(w, prev[si], c.bytes);
+			put_command(w, schema(c.stream), prev[si], c.fields);
 			// Past the budget it waits for a later packet. The first always goes, so a command bigger
 			// than a packet can't stall everything behind it.
 			if (sent.size() == 255 || (!sent.empty() && (int)(body.size() + w.size()) > budget)) {
 				continue;
 			}
 			body.put_data(w);
-			prev[si] = &c.bytes;
+			prev[si] = &c.fields;
 			last_seq = c.seq;
 			sent.push_back(i);
 		}
@@ -293,6 +411,7 @@ public:
 		fresh.rate_ = rate_;
 		fresh.update_rate_ = update_rate_;
 		fresh.backup_ = backup_;
+		fresh.schemas_ = std::move(schemas_);
 		*this = std::move(fresh);
 	}
 
@@ -300,7 +419,7 @@ private:
 	struct Cmd {
 		uint16_t seq = 0;
 		uint32_t stream = 0;
-		std::vector<uint8_t> bytes;
+		Command fields;
 		uint32_t sends = 0;
 		uint32_t last_sent_ms = 0;
 		uint16_t last_packet = 0; // the uplink packet that last carried it
@@ -321,6 +440,7 @@ private:
 	static constexpr int HEADER_BYTES = 23;
 
 	std::deque<Cmd> ring_; // unacked, oldest first
+	std::unordered_map<uint32_t, Schema> schemas_;
 	uint16_t next_seq_ = 1;
 	uint32_t interval_ms_ = 0;
 	uint32_t rate_ = 0;
@@ -406,7 +526,7 @@ public:
 private:
 	struct Held {
 		uint32_t stream = 0;
-		std::vector<uint8_t> bytes;
+		Command fields;
 	};
 	struct Peer {
 		bool started = false;
@@ -463,23 +583,36 @@ bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_si
 	struct In {
 		uint16_t seq;
 		int stream;
-		std::vector<uint8_t> bytes;
+		Command fields;
 	};
-	const int cmd_ct = r.get_u8();
+	// Copied, so a host that rebuilds its table while answering can't leave one dangling.
+	std::vector<Schema> schemas(stream_ct);
+	bool known = true;
+	for (int i = 0; i < stream_ct && known; i++) {
+		const Schema *schema = p_host.command_schema(p_peer, streams[i]);
+		known = schema != nullptr;
+		if (known) {
+			schemas[i] = *schema;
+		}
+	}
+	int cmd_ct = r.get_u8();
+	if (!known) {
+		cmd_ct = 0; // the commands are the end of the packet, so nothing else is lost with them
+	}
 	std::vector<In> cmds(cmd_ct);
-	std::vector<const std::vector<uint8_t> *> prev(stream_ct, nullptr);
+	std::vector<const Command *> prev(stream_ct, nullptr);
 	uint16_t seq = cmd_ct > 0 ? r.get_u16() : 0;
 	for (int i = 0; i < cmd_ct && !r.failed(); i++) {
 		if (i > 0) {
 			seq = (uint16_t)(seq + 1 + get_uvarint(&r));
 		}
 		const int si = stream_ct > 1 ? r.get_u8() : 0;
-		if (si >= stream_ct || !get_byte_delta(r, prev[si], cmds[i].bytes)) {
+		if (si >= stream_ct || !get_command(r, schemas[si], prev[si], cmds[i].fields)) {
 			return false;
 		}
 		cmds[i].seq = seq;
 		cmds[i].stream = si;
-		prev[si] = &cmds[i].bytes;
+		prev[si] = &cmds[i].fields;
 	}
 	if (r.failed()) {
 		return false; // nothing from a truncated packet, not even its ack
@@ -536,14 +669,14 @@ bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_si
 			continue; // delivered already, a repeat, or implausibly far ahead
 		}
 		any_new = true;
-		p.held[c.seq] = Held{ streams[c.stream], std::move(c.bytes) };
+		p.held[c.seq] = Held{ streams[c.stream], std::move(c.fields) };
 	}
 	for (auto it = p.held.find(p.next); it != p.held.end(); it = p.held.find(p.next)) {
 		const Held h = std::move(it->second);
 		p.held.erase(it);
 		p.next = command_seq_next(p.next);
 		p.delivered = true;
-		p_host.command(p_peer, h.stream, h.bytes.data(), h.bytes.size());
+		p_host.command(p_peer, h.stream, h.fields);
 	}
 	// Nothing new in a packet of commands: backups ride with new ones, so this is the client resending
 	// for want of our ack. Or the server is stuck behind a lost one.

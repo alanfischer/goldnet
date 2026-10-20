@@ -156,10 +156,14 @@ struct ServerApp {
 
 	void protocol_mismatch(int32_t peer) { fprintf(stderr, "[server] peer %d speaks a different version\n", peer); }
 	void message(int32_t, const uint8_t *, size_t, bool) {}
-	void command(int32_t peer, uint32_t, const uint8_t *data, size_t size) {
+	const goldnet::Schema *command_schema(int32_t, uint32_t) {
+		static const goldnet::Schema bytes_only{ goldnet::FIELD_BYTES };
+		return &bytes_only;
+	}
+	void command(int32_t peer, uint32_t, const goldnet::Command &c) {
 		auto it = players.find(peers[peer].player);
 		Input in;
-		if (it == players.end() || !read_input(data, size, in)) {
+		if (it == players.end() || !read_input(c[0].bytes.data(), c[0].bytes.size(), in)) {
 			return;
 		}
 		it->second.commands++;
