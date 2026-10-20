@@ -54,6 +54,8 @@ struct TestServerHost {
 		e.slots = (int)w.vals.size();
 		e.push = w.push;
 		e.priority = w.priority;
+		e.stepped.assign(e.slots, 1);
+		e.kinds_check = 7;
 	}
 	void read(TestServer::Entity &e, bool polled_only) {
 		world->reads++;
@@ -67,9 +69,9 @@ struct TestServerHost {
 	}
 	bool visible(const TestServer::Entity &e, int32_t peer) { return world->is_visible(e.key, peer); }
 	bool spawn_visible(uint64_t key, int32_t peer) { return world->is_visible(key, peer); }
-	void encode(Writer &w, const Val &v, uint8_t, uint32_t) {
-		w.put_u8(TAG_INT);
-		put_varint(&w, v);
+	// An int as its step from the peer's baseline value, the way a host codes an int slot.
+	void encode(Writer &w, const TestServer::Entity &e, int slot, const Val *base, uint32_t) {
+		put_varint(&w, e.vals[slot] - (base ? *base : 0));
 	}
 	void send(int32_t peer, const Writer &w) {
 		world->outbox[peer].emplace_back(w.data(), w.data() + w.size());
@@ -92,6 +94,7 @@ struct Peer {
 	std::vector<std::string> events; // spawns, messages and despawns, in the order the host saw them
 	int mismatches = 0;
 	int refuse_spawns = 0; // the host can't create the next N spawns yet
+	uint8_t kinds_check = 7; // how this host reads slots; the server's host says 7
 	std::map<uint32_t, std::pair<uint32_t, int>> creates; // spawn net_id -> the entity it registers
 	uint32_t cur = 0;
 };
@@ -123,9 +126,12 @@ struct TestClientHost {
 	}
 	void relevance_lost(uint32_t net_id) { p->lost.push_back(net_id); }
 	bool registered(uint32_t net_id) { return p->slot_count.count(net_id) > 0; }
-	int begin_entity(uint32_t net_id, uint32_t mask, bool &r_defer) {
+	int begin_entity(uint32_t net_id, uint32_t mask, bool whole, uint8_t kinds_check, bool &r_defer) {
 		p->cur = net_id;
 		if (!p->slot_count.count(net_id)) {
+			return -1;
+		}
+		if (whole && kinds_check != p->kinds_check) {
 			return -1;
 		}
 		if (p->not_ready.count(net_id)) {
@@ -145,10 +151,7 @@ struct TestClientHost {
 			p->synced[p->cur]++;
 		}
 	}
-	Val decode(Reader &r, uint32_t) {
-		r.get_u8();
-		return get_varint(&r);
-	}
+	Val decode(Reader &r, int, const Val *base, uint32_t) { return (base ? *base : 0) + get_varint(&r); }
 };
 
 struct TestUplinkHost {
@@ -232,6 +235,25 @@ struct Net {
 };
 
 static uint16_t base_seq_of(const std::vector<uint8_t> &pkt) { return (uint16_t)(pkt[3] | (pkt[4] << 8)); }
+
+// The bytes of a snapshot's entity section, for one with no spawns, despawns or leaves.
+static size_t entity_bytes(const std::vector<uint8_t> &pkt) {
+	Reader r(pkt.data(), pkt.size());
+	r.get_u8();
+	r.get_u16();
+	r.get_u16();
+	r.get_u32();
+	r.get_u16();
+	get_uvarint(&r);
+	get_uvarint(&r);
+	get_uvarint(&r);
+	ChannelPart chan;
+	chan.read(r);
+	for (int i = 0; i < 4; i++) {
+		r.get_u16();
+	}
+	return r.remaining();
+}
 // With an empty channel part and no uplink report, the spawn count follows the 11-byte header, the
 // report's two 1-byte zeros and the channel part's 5 bytes.
 static uint16_t spawn_ct_of(const std::vector<uint8_t> &pkt) { return (uint16_t)(pkt[18] | (pkt[19] << 8)); }
@@ -810,7 +832,7 @@ static void test_warmup_defer_then_accept() {
 	n.add_entity(10, 100, { 1 });
 	n.add_entity(11, 101, { 2 });
 	p.not_ready.insert(101);
-	n.tick(); // first frame is accepted regardless
+	n.tick(); // even the first frame isn't acked while 101 isn't ready
 	n.world.ents[11].vals[0] = 3;
 	n.tick(); // 101 still not ready: not acked past it
 	CHECK(p.vals[101].empty());
@@ -818,6 +840,70 @@ static void test_warmup_defer_then_accept() {
 	n.tick();
 	CHECK(p.vals[101] == std::vector<Val>{ 3 });
 	printf("  warmup defer, then accept once ready: ok\n");
+}
+
+// A slot goes as its change from the value the peer holds at its baseline, so the same state costs
+// less as a delta than whole. One that moved and came back while the baseline stood still still
+// goes: the client applied the move from a frame the server never heard was acked.
+static void test_slots_go_as_changes() {
+	Net n;
+	Peer &p = n.add_peer(2);
+	n.add_entity(10, 100, { 1000000, 5 });
+	n.tick();
+	n.world.ents[10].vals[0] = 1000001;
+	n.server.mark_dirty(10);
+	n.tick();
+	CHECK(p.vals[100][0] == 1000001);
+	// net_id 4, head 1, length 1, and a step of +1 in one byte.
+	CHECK(entity_bytes(n.last_packet(2)) == 7);
+	n.drop_acks.insert(2); // the peer's baseline stays put while the slot moves and returns
+	n.world.ents[10].vals[1] = 6;
+	n.server.mark_dirty(10);
+	n.tick();
+	n.world.ents[10].vals[1] = 5;
+	n.server.mark_dirty(10);
+	n.tick();
+	n.drop_acks.clear();
+	n.tick();
+	CHECK(p.vals[100] == (std::vector<Val>{ 1000001, 5 }));
+	printf("  slots go as their change from the baseline, and one back where it was still lands: ok\n");
+}
+
+// A baseline older than a slot's history can't be stepped from: the entity goes whole, and lands.
+static void test_aged_history_goes_whole() {
+	Net n;
+	Peer &p = n.add_peer(2);
+	n.add_entity(10, 100, { 0 });
+	n.tick();
+	n.drop_acks.insert(2);
+	for (int i = 1; i <= SLOT_HISTORY + 5; i++) {
+		n.world.ents[10].vals[0] = i * 1000;
+		n.server.mark_dirty(10);
+		n.tick();
+	}
+	n.drop_acks.clear();
+	n.drop_snapshots.insert(2);
+	n.world.ents[10].vals[0] = 7;
+	n.server.mark_dirty(10);
+	n.tick();
+	n.drop_snapshots.clear();
+	n.tick();
+	CHECK(p.vals[100][0] == 7);
+	printf("  a baseline older than the slot's history gets the entity whole: ok\n");
+}
+
+// A client whose host would read the slots differently refuses the entity rather than misreading it.
+static void test_kinds_mismatch_refuses_entity() {
+	Net n;
+	Peer &p = n.add_peer(2);
+	p.kinds_check = 9;
+	n.add_entity(10, 100, { 4 });
+	n.add_entity(11, 101, { 5 });
+	n.tick();
+	n.tick();
+	CHECK(p.vals[100] == (std::vector<Val>{ 0 }) || p.vals[100].empty());
+	CHECK(p.synced[100] == 0);
+	printf("  a kinds mismatch refuses the entity: ok\n");
 }
 
 static void test_removed_entity_leaves_client_frame() {
@@ -1131,6 +1217,9 @@ int main() {
 	test_update_rate_grant();
 	test_push_declared_slots_skip_reads();
 	test_warmup_defer_then_accept();
+	test_slots_go_as_changes();
+	test_aged_history_goes_whole();
+	test_kinds_mismatch_refuses_entity();
 	test_removed_entity_leaves_client_frame();
 	test_rate_chokes_to_the_budget();
 	test_charged_traffic_delays_the_next_snapshot();

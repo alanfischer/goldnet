@@ -26,11 +26,15 @@
 //   void despawn(uint32_t net_id)                  only for an id whose spawn() returned true
 //   void relevance_lost(uint32_t net_id)
 //   bool registered(uint32_t net_id)               does an entity with this id exist here?
-//   int  begin_entity(uint32_t net_id, uint32_t mask, bool &r_defer)
-//        slot count of a live target, or -1 if none; r_defer = known but not ready (warmup)
+//   int  begin_entity(uint32_t net_id, uint32_t mask, bool whole, uint8_t kinds_check, bool &r_defer)
+//        slot count of a live target, or -1 if none (its slots are then stepped over); r_defer =
+//        known but not ready (warmup). On a whole entity, kinds_check is the server host's summary
+//        of how it codes the slots: a host that would read them differently returns -1.
+//   V    decode(Reader &r, int slot, const V *base, uint32_t ref_time_ms)
+//        the current target's slot, as the server host's encode wrote it: its change from base,
+//        the value at the baseline, or whole when base is null
 //   bool set_slot(int slot, const V &v)            apply to the current target; true if applied
 //   void end_entity(bool applied)                  the current target is done
-//   V    decode(Reader &r, uint32_t ref_time_ms)   one tagged value
 //
 // Messages are delivered from any snapshot newer than every one before it, committed or not:
 // the reliable ones before the spawns, the datagram's after the entity deltas and before the
@@ -365,43 +369,60 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	for (int i = 0; i < count && !r.failed(); i++) {
 		const uint32_t net_id = r.get_u32();
 		const uint32_t mask = get_uvarint(&r);
+		const uint32_t len_whole = get_uvarint(&r);
+		const uint32_t len = len_whole >> 1;
+		const bool whole = (len_whole & 1) != 0;
+		const uint8_t kinds_check = whole ? r.get_u8() : 0;
+		const uint8_t *data = r.get_data(len);
+		if (!data) {
+			break;
+		}
 
+		// Start from this entity's baseline values, then overlay the changed slots. A change can only
+		// be applied to the value it is a change from, so a delta for an entity missing from the
+		// baseline frame can't be applied at all.
+		auto cur = frame.find(net_id);
 		bool defer = false;
-		const int n_slots = p_host.begin_entity(net_id, mask, defer);
+		const int n_slots = p_host.begin_entity(net_id, mask, whole, kinds_check, defer);
 		if (defer) {
 			defer_ack = true;
 		}
-
-		// Start from this entity's baseline values, then overlay the changed slots. Values are read
-		// for every set bit whether or not there is a target, so the stream stays aligned even for
-		// unknown ids.
-		auto cur = frame.find(net_id);
+		if (n_slots < 0) {
+			continue;
+		}
+		if (!whole && cur == frame.end()) {
+			// Known here, but not held at the baseline the server thinks it is: hold the ack, so the
+			// server keeps diffing against a frame we have, until the cap gives up.
+			defer_ack = true;
+			p_host.end_entity(false);
+			continue;
+		}
 		std::vector<V> vals;
 		if (cur != frame.end()) {
 			vals = cur->second;
 		}
-		if (n_slots >= 0 && vals.size() != (size_t)n_slots) {
-			vals.resize(n_slots);
-		}
+		vals.resize(n_slots);
+		Reader vr(data, len);
 		bool applied = false;
-		for (int s = 0; s < MAX_SLOTS; s++) {
+		for (int s = 0; s < n_slots && s < MAX_SLOTS; s++) {
 			if (!(mask & (1u << s))) {
 				continue;
 			}
-			V v = p_host.decode(r, server_time); // self-delimiting — always consume
-			if ((size_t)s < vals.size()) {
-				vals[s] = v;
+			V v = p_host.decode(vr, s, whole ? nullptr : &vals[s], server_time);
+			if (vr.failed()) {
+				break;
 			}
-			if (n_slots >= 0 && s < n_slots && p_host.set_slot(s, v)) {
+			vals[s] = v;
+			if (p_host.set_slot(s, v)) {
 				applied = true;
 			}
 		}
-		if (!vals.empty()) {
+		if (vr.failed()) {
+			defer_ack = true; // the host read the slots differently than they were written: not a frame to ack
+		} else {
 			frame[net_id] = std::move(vals);
 		}
-		if (n_slots >= 0) {
-			p_host.end_entity(applied);
-		}
+		p_host.end_entity(applied);
 	}
 
 	deliver(unreliable, false);
@@ -440,13 +461,13 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	// acking this seq would advance the server's baseline past the entity; an idle one that never
 	// changes again would then never be resent — stranded hidden. Instead re-ack our last good
 	// frame so the server keeps resending its full baseline against a frame we hold, and drop this
-	// one uncommitted. Capped, and needs a prior good frame to fall back to; on the very first
-	// frame we just accept it.
+	// one uncommitted. Capped. On the very first frame there's no good frame to re-ack, so it holds
+	// by not acking at all, and the server keeps sending full state: acking would leave the server
+	// sure we hold the entity, and every later delta would be a change from a value we never got.
 	//
 	// A refused spawn holds the same way, for the same reason: acking a frame that carries it tells
-	// the server it was delivered, and it's never sent again. That one holds even on the first
-	// frame, by not acking at all, since the server then keeps sending full state with the spawn.
-	if ((spawn_refused || (defer_ack && has_)) && defer_streak_ < MAX_DEFER_STREAK) {
+	// the server it was delivered, and it's never sent again.
+	if ((spawn_refused || defer_ack) && defer_streak_ < MAX_DEFER_STREAK) {
 		defer_streak_++;
 		if (has_) {
 			queue_ack(last_seq_, info);

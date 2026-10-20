@@ -24,9 +24,15 @@ static bool approx(float a, float b, float tol) {
 	return std::fabs(a - b) < tol;
 }
 
-// One quantization step of angle16. The encoder truncates rather than rounds, so
-// round-trip error is in [0, STEP) — never more than one step, never negative.
+// One quantization step of angle16. The encoder rounds, so round-trip error is at most half a
+// step around the circle: just under TAU comes back as 0, the same heading.
 static const float STEP = TAU / 65536.0f;
+
+// Distance between two headings, the short way round.
+static bool approx_angle(float a, float b, float tol) {
+	float d = std::fabs(std::fmod(a - b, TAU));
+	return std::fmin(d, TAU - d) < tol;
+}
 
 // --- varint ---
 
@@ -321,7 +327,7 @@ static void test_angle8_roundtrip() {
 		FakeBuf buf;
 		put_angle8(&buf, a);
 		buf.rewind();
-		CHECK(approx(get_angle8(&buf), a, STEP8 * 2.0f));
+		CHECK(approx_angle(get_angle8(&buf), a, STEP8 * 2.0f));
 		CHECK(buf.size() == 1); // the entire point: 1 byte, not 2 or 4
 	}
 	printf("  angle8 roundtrip: ok\n");

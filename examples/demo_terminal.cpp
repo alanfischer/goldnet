@@ -174,7 +174,6 @@ struct ServerApp {
 			e.slots = 2; // live balls, total bounces
 		} else {
 			e.slots = BALL_SLOTS;
-			e.quant = BALL_QUANT;
 		}
 	}
 	void read(DemoServer::Entity &e, bool) {
@@ -191,7 +190,10 @@ struct ServerApp {
 	}
 	bool visible(const DemoServer::Entity &, int32_t) { return true; }
 	bool spawn_visible(uint64_t, int32_t) { return true; }
-	void encode(Writer &w, const Value &v, uint8_t quant, uint32_t now) { encode_value(w, v, quant, now); }
+	// Every value whole and self-tagged: simple, and right against any base.
+	void encode(Writer &w, const DemoServer::Entity &e, int slot, const Value *, uint32_t now) {
+		encode_value(w, e.vals[slot], e.key == SCOREBOARD_ID ? QUANT_AUTO : BALL_QUANT[slot], now);
+	}
 	void send(int32_t peer, const Writer &packet) {
 		Outgoing o{ peers[peer].addr, std::vector<uint8_t>(packet.data(), packet.data() + packet.size()) };
 		bytes_out += o.bytes.size();
@@ -403,7 +405,7 @@ struct ClientApp {
 	}
 	void relevance_lost(uint32_t) {}
 	bool registered(uint32_t net_id) { return ents.count(net_id) > 0; }
-	int begin_entity(uint32_t net_id, uint32_t, bool &) {
+	int begin_entity(uint32_t net_id, uint32_t, bool, uint8_t, bool &) {
 		cur = net_id;
 		auto it = ents.find(net_id);
 		return it == ents.end() ? -1 : (int)it->second.vals.size();
@@ -413,7 +415,7 @@ struct ClientApp {
 		return true;
 	}
 	void end_entity(bool) {}
-	Value decode(Reader &r, uint32_t ref_time_ms) { return decode_value(r, ref_time_ms); }
+	Value decode(Reader &r, int, const Value *, uint32_t ref_time_ms) { return decode_value(r, ref_time_ms); }
 
 	void transmit(const std::vector<uint8_t> &pkt) {
 		sendto(fd, pkt.data(), pkt.size(), 0, (sockaddr *)&server_addr, sizeof(server_addr));

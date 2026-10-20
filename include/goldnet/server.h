@@ -6,18 +6,28 @@
 // answers, the value encoding, and the send.
 //
 // V is the host's value type. It must be default-constructible, copyable and comparable with !=;
-// the server never looks inside one, it only compares and stores them and hands them back to the
-// host to encode. X is optional per-entity storage for the host (cached property lookups, say),
+// the server never looks inside one, it only compares and stores them and hands them back
+// to the host to encode. X is optional per-entity storage for the host (cached property lookups, say),
 // carried on the entity so reaching it costs no second lookup.
 //
 // The host passed to tick() provides:
 //   bool live(Entity &e)                        is the entity replicating this tick? (may refresh e.user)
-//   void prepare(Entity &e)                     first live tick: set e.slots, e.quant, e.push, e.priority
+//   void prepare(Entity &e)                     first live tick: set e.slots, e.push, e.stepped,
+//                                               e.priority, e.kinds_check
 //   void read(Entity &e, bool polled_only)      read the slot values, calling stamp() for each
 //   bool visible(const Entity &e, int32_t peer) per-peer visibility of a live entity
 //   bool spawn_visible(uint64_t key, int32_t peer)  same, for a spawn record's visibility keys
-//   void encode(Writer &w, const V &v, uint8_t quant, uint32_t now_ms)  one tagged value
+//   void encode(Writer &w, const Entity &e, int slot, const V *base, uint32_t now_ms)
+//        slot's current value (e.vals[slot]), as its change from base, the value the peer holds,
+//        or whole when base is null (always null for a slot not in e.stepped). Client::apply's
+//        host decodes it the same way.
 //   void send(int32_t peer, const Writer &packet)
+//
+// An entity's changed slots go as a mask, a flag saying whether they're whole, and their bytes
+// behind a length, so a client that can't decode them (an id it doesn't know) can step over them.
+// They're whole when the peer doesn't hold the entity at its baseline, or a changed stepped slot's
+// value at that baseline has left its history (SLOT_HISTORY); a whole entity also carries the
+// host's kinds_check, so a client whose host would read its slots differently can refuse them.
 //
 // Spawns. An entity the client already has (one loaded with the map, at the same net_id on both
 // ends) needs only add_entity. A runtime entity, which the client has no other way to know about,
@@ -77,8 +87,9 @@ public:
 		uint64_t key = 0;    // the host's identity for it (stable for the entity's life)
 		uint32_t net_id = 0; // its identity on the wire, identical on server and client
 		int slots = 0;
-		// Per-slot quantization tag (QUANT_AUTO = none). Empty means all-auto.
-		std::vector<uint8_t> quant;
+		// Per slot: the host codes it against the peer's baseline value (encode's base), so the
+		// server keeps its recent values. Empty means none is.
+		std::vector<uint8_t> stepped;
 		// Per-slot push declaration: listing a slot is the host's promise to mark_dirty() every
 		// write to it; every slot NOT listed is read every tick regardless of the mark. That
 		// inversion is the point: an undeclared slot cannot go stale, so forgetting to mark one
@@ -101,6 +112,16 @@ public:
 		// changed. A peer needs slot s iff slot_ctr[s] > its baseline's counter.
 		std::vector<V> vals;
 		std::vector<uint32_t> slot_ctr;
+		// Each stepped slot's recent changes as (snapshot counter, value), in a ring: what a peer holds
+		// at its baseline is the newest one at or before the baseline's counter.
+		struct History {
+			std::vector<std::pair<uint32_t, V>> ring;
+			size_t next = 0; // where the next change goes; once full, the oldest
+		};
+		std::vector<History> history;
+		// The host's summary of how it codes this entity's slots (see encode), sent with every whole
+		// entity so a client can tell it would read them differently.
+		uint8_t kinds_check = 0;
 		X user;
 	};
 
@@ -176,7 +197,37 @@ public:
 		if (p_value != p_e.vals[p_slot]) {
 			p_e.vals[p_slot] = p_value;
 			p_e.slot_ctr[p_slot] = ctr_;
+			if (stepped(p_e, p_slot)) {
+				typename Entity::History &h = p_e.history[p_slot];
+				if (h.ring.size() < (size_t)SLOT_HISTORY) {
+					h.ring.emplace_back(ctr_, p_value);
+				} else {
+					h.ring[h.next] = { ctr_, p_value };
+				}
+				h.next = (h.next + 1) % SLOT_HISTORY;
+			}
 		}
+	}
+
+	static bool stepped(const Entity &p_e, int p_slot) {
+		return (size_t)p_slot < p_e.stepped.size() && p_e.stepped[p_slot];
+	}
+
+	// A stepped slot's value as of counter p_ctr, or null if that has left its history.
+	static const V *value_at(const Entity &p_e, int p_slot, uint32_t p_ctr) {
+		const typename Entity::History &h = p_e.history[p_slot];
+		const size_t n = h.ring.size();
+		const size_t oldest = n < (size_t)SLOT_HISTORY ? 0 : h.next;
+		if (n == 0 || h.ring[oldest].first > p_ctr) {
+			return nullptr;
+		}
+		for (size_t i = 1; i <= n; i++) {
+			const std::pair<uint32_t, V> &entry = h.ring[(oldest + n - i) % n];
+			if (entry.first <= p_ctr) {
+				return &entry.second;
+			}
+		}
+		return nullptr;
 	}
 
 	// Whether a polled-only read should skip slot s (the host promised to mark it and didn't).
@@ -456,6 +507,7 @@ private:
 		uint32_t mask;
 		float score;
 		bool holdable; // false while the entity's spawn isn't proven delivered to this peer
+		bool whole;    // its slots go whole rather than as their change from the peer's baseline
 	};
 
 	std::vector<Entity> ents_;
@@ -579,6 +631,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 		if (e.vals.size() != (size_t)e.slots) {
 			e.vals.resize(e.slots);
 			e.slot_ctr.assign(e.slots, ctr_);
+			e.history.assign(e.slots, {});
 		}
 		// A marked entity is read whole. A clean one keeps the values and stamps it already has for
 		// every slot it declared, which is all any peer — including one being sent a full baseline —
@@ -594,6 +647,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 	}
 
 	std::vector<Candidate> candidates;
+	Writer vals; // one entity's slot bytes, reused so its capacity outlives the entity
 	for (int32_t peer : due) {
 		PeerRing &pr = rings_[peer];
 		pr.last_sent_ms = p_now;
@@ -714,15 +768,21 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 			// slot delta against that baseline would leave the client hidden with nothing to re-show
 			// it (an idle entity re-entering changes no slot at all).
 			uint32_t mask = 0;
+			bool whole = false;
 			const int n_vals = (int)e.vals.size();
 			const bool holdable = !unproven_.count(e.key) && !unproven_ids_.count(net_id);
 			if (!base || !base->count(net_id) || pr.left_unacked.count(net_id)) {
 				mask = n_vals >= MAX_SLOTS ? 0xFFFFFFFFu : ((1u << n_vals) - 1u); // new → all slots
+				whole = true;
 			} else {
+				// Every slot that changed since the baseline goes, even one back at the baseline's value:
+				// the client may have applied a newer frame since. One whose baseline value has left
+				// its history sends the entity whole.
 				const int n_slots = std::min(n_vals, (int)e.slot_ctr.size());
 				for (int s = 0; s < n_slots; s++) {
 					if (e.slot_ctr[s] > base_ctr) {
 						mask |= (1u << s);
+						whole = whole || (stepped(e, s) && !value_at(e, s, base_ctr));
 					}
 				}
 			}
@@ -742,6 +802,7 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 			c.net_id = net_id;
 			c.mask = mask;
 			c.score = (float)(wait_ticks + 1) * e.priority;
+			c.whole = whole;
 			c.holdable = holdable;
 			if (c.score != 1.0f) {
 				needs_sort = true;
@@ -810,13 +871,20 @@ void Server<V, X>::tick(uint32_t p_now, const std::vector<int32_t> &p_peers, Hos
 				continue;
 			}
 			const Entity &e = ents_[c.idx];
-			body.put_u32(c.net_id);
-			put_uvarint(&body, c.mask); // most entities set only the low few bits — 1 byte, not 4
+			vals.clear();
 			for (size_t s = 0; s < e.vals.size(); s++) {
 				if (c.mask & (1u << s)) {
-					p_host.encode(body, e.vals[s], s < e.quant.size() ? e.quant[s] : QUANT_AUTO, p_now);
+					const bool from_base = !c.whole && stepped(e, (int)s);
+					p_host.encode(vals, e, (int)s, from_base ? value_at(e, (int)s, base_ctr) : nullptr, p_now);
 				}
 			}
+			body.put_u32(c.net_id);
+			put_uvarint(&body, c.mask); // most entities set only the low few bits — 1 byte, not 4
+			put_uvarint(&body, (uint32_t)(vals.size() << 1) | (c.whole ? 1u : 0u));
+			if (c.whole) {
+				body.put_u8(e.kinds_check);
+			}
+			body.put_data(vals);
 			if (c.holdable) {
 				included.insert(c.net_id);
 			}

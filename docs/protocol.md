@@ -92,18 +92,42 @@ len bytes             spawn data, opaque to the protocol (Godot: var_to_bytes of
 
 ```
 u32      net_id
-uvarint  mask         bit s set = slot s follows
-value    × popcount(mask), in ascending slot order
+uvarint  mask                bit s set = slot s follows
+uvarint  len << 1 | whole    then, after kinds_check, len bytes: each changed slot, ascending
+u8       kinds_check         only when whole: the server host's summary of how it codes the slots
 ```
 
 A slot is an index into the entity's replicated properties — in Godot, the order of its
-synchronizer's `SceneReplicationConfig`. At most `MAX_SLOTS` = 32. Values are self-delimiting, so
-a receiver can skip an entity it doesn't know without losing its place.
+synchronizer's `SceneReplicationConfig`. At most `MAX_SLOTS` = 32. The slots' bytes are the host's:
+a slot the host declares stepped is coded against `base`, the value the peer holds for it at
+`base_seq`, unless `whole` is set, when there is no base. An entity goes whole when the peer doesn't
+hold it at the baseline, or when a changed stepped slot's value at the baseline has left the
+server's history of it (`SLOT_HISTORY` = 64 changes). The length lets a receiver step over an entity it doesn't know, or one whose
+`kinds_check` doesn't match its own host's.
 
 ## Values
 
-A value is a 1-byte tag followed by its payload. The receiver needs only the tag; which lossy tag
-to use is the sender's choice (in Godot, the `gn_quant` meta).
+goldnet-godot codes a slot by its **kind**, which both ends work out from the property's declared
+type and its hint (`gn_quant`, `gn_grid`), so a value carries no tag:
+
+| Kind | From | Against a base | Whole |
+|------|------|----------------|-------|
+| int | `int` | `varint` step | `varint` |
+| bool | `bool` | `u8` | `u8` |
+| float | `float` | `f32` | `f32` |
+| half | `float`, `half` | `f16` | `f16` |
+| angle16 / angle8 | `float`, `angle16` / `angle8` | `varint` shortest step in quanta (rounded) | `u16` / `u8` |
+| vector3 | `Vector3` | 3 × `f32` | 3 × `f32` |
+| vector3 half | `Vector3`, `vec3_half` | 3 × `f16` | 3 × `f16` |
+| float grid / vector3 grid | `float` / `Vector3`, `gn_grid` step | `varint` step in grid units, each axis | `varint` in grid units, each axis |
+| time delta | `int`, `time_delta` | `varint` of (value − `server_time`) | the same |
+| tagged | anything else | a tagged value, below | a tagged value |
+
+`kinds_check` is a hash of the kinds and grids. A slot whose property is untyped or of another type
+goes as a tagged value, which needs no hint to decode:
+
+A tagged value is a 1-byte tag followed by its payload. Which lossy tag to use is the sender's choice
+(in Godot, the `gn_quant` meta).
 
 | Tag | Name         | Payload | Decodes to |
 |----:|--------------|---------|------------|
@@ -112,10 +136,10 @@ to use is the sender's choice (in Godot, the `gn_quant` meta).
 | 2   | `INT`        | `varint` | int |
 | 3   | `VEC3`       | 3 × `f32`, x y z | vector3 |
 | 4   | `BOOL`       | `u8`, nonzero = true | bool |
-| 5   | `ANGLE16`    | `u16` = radians wrapped into [0, τ) × 65536 / τ, truncated, mod 65536 | `u16 / 65536 × τ` |
+| 5   | `ANGLE16`    | `u16` = radians wrapped into [0, τ) × 65536 / τ, rounded, mod 65536 | `u16 / 65536 × τ` |
 | 6   | `HALF`       | `f16` | float |
 | 7   | `VEC3_HALF`  | 3 × `f16`, x y z | vector3 |
-| 8   | `ANGLE8`     | `u8` = radians wrapped into [0, τ) × 256 / τ, truncated, mod 256 | `u8 / 256 × τ` |
+| 8   | `ANGLE8`     | `u8` = radians wrapped into [0, τ) × 256 / τ, rounded, mod 256 | `u8 / 256 × τ` |
 | 9   | `TIME_DELTA` | `varint` of (value − this snapshot's `server_time`) | `server_time` + delta, as int |
 
 Angles take NaN as 0. `TIME_DELTA` applies only to integer ms timestamps; the sender falls back
@@ -288,7 +312,9 @@ Per tick, for each peer:
    so both in one snapshot would skip the spawn as one it holds and then free the entity. Leaves
    are derived from the baseline instead, so they repeat every snapshot until acked (see **Ack**).
 4. **Entities.** An entity is a candidate when it is visible to the peer and has any slot that
-   changed since the baseline. Each changed slot is written with its current value. An entity
+   changed since the baseline. Each changed slot is written against its value at the baseline,
+   from the slot's history of changes, even one back at that value: the client may have applied a
+   newer frame since. An entity
    named by a spawn not yet proven delivered to the peer is written whole and left out of the
    frame's baseline: a client that missed the spawn discards its values and acks anyway.
 5. **Budget.** The whole snapshot aims for `SAFE_PACKET_BYTES` = 1200. Header and the three
@@ -318,8 +344,10 @@ For each snapshot:
 5. **Apply.** Spawns are applied in order, as read, skipping any net_id the client already created:
    an unacked spawn arrives again as backups and on every overdue resend. A spawn the client can't create yet isn't
    counted as created, so a later resend gets another try. The new frame starts as a copy of the
-   baseline (empty for `base_seq` 0); each entity entry overwrites its changed slots and is applied
-   to the entity. Despawns are applied after the entities, only for net_ids the client created
+   baseline (empty for `base_seq` 0); each entity entry decodes its changed slots against that
+   frame's values and is applied to the entity. A delta for an entity the baseline frame lacks
+   can't be decoded and is stepped over; if the client knows the entity, it holds the ack, as it
+   does for one not ready yet, even on its first frame. Despawns are applied after the entities, only for net_ids the client created
    (they repeat the same way), then entities that no longer exist locally are dropped from the
    frame, then leaves are dropped from it and reported.
 6. **Truncated.** If the packet ran short, keep whatever it applied but neither commit nor ack.

@@ -102,11 +102,9 @@ struct ServerApp {
 	void prepare(GServer::Entity &e) {
 		if (players.count(e.net_id)) {
 			e.slots = PLAYER_SLOTS;
-			e.quant = player_quant();
 			e.priority = 4.0f; // players before blocks when a packet overflows
 		} else {
 			e.slots = BLOCK_SLOTS;
-			e.quant = block_quant();
 		}
 	}
 	void read(GServer::Entity &e, bool) {
@@ -136,7 +134,10 @@ struct ServerApp {
 	}
 	bool visible(const GServer::Entity &, int32_t) { return true; }
 	bool spawn_visible(uint64_t, int32_t) { return true; }
-	void encode(Writer &w, const Value &v, uint8_t quant, uint32_t) { encode_value(w, v, quant); }
+	// Every value whole and self-tagged: simple, and right against any base.
+	void encode(Writer &w, const GServer::Entity &e, int slot, const Value *, uint32_t) {
+		encode_value(w, e.vals[slot], (players.count(e.net_id) ? player_quant() : block_quant())[slot]);
+	}
 	void send(int32_t peer, const Writer &packet) {
 		Outgoing o{ peers[peer].addr, std::vector<uint8_t>(packet.data(), packet.data() + packet.size()) };
 		bytes_out += o.bytes.size();
