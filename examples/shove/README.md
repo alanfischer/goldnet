@@ -30,5 +30,8 @@ is frictionless and the blocks bring their own. With friction on the floor, the 
 added friction to the player that depended on contact state the client can't rebuild after a
 reset, and the replay drifted by about a centimetre per snapshot.
 
+The wire is UDP. `shove::run` in `app.h` takes a `Wires` that makes it, so a host can run the same
+game over another transport.
+
 Known gaps: the rendering hasn't been looked at yet, a few percent of predicted throws are never
 claimed by the server, and knockback from hits isn't predicted.

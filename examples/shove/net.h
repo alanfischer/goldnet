@@ -1,7 +1,7 @@
 #pragma once
 //
 // What the shove server and client share about the wire: the value type goldnet carries, its
-// encoding, the UDP socket, and the framing around goldnet's packets.
+// encoding, the wire (UDP unless a host supplies another), and the framing around goldnet's packets.
 //
 // Client -> server datagrams are 'H' (hello: start a session), 'U' + an uplink packet, or 'D'
 // (leaving). Server -> client datagrams are goldnet snapshots, unframed. Connection management is
@@ -22,8 +22,11 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <memory>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace shove {
 
@@ -105,45 +108,117 @@ inline uint32_t get_u32_le(const uint8_t *p) {
 	return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-inline int open_socket(uint16_t port) {
-	const int fd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (fd < 0) {
-		perror("socket");
-		exit(1);
-	}
-	sockaddr_in addr = {};
-	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = htonl(INADDR_ANY);
-	addr.sin_port = htons(port);
-	if (bind(fd, (sockaddr *)&addr, sizeof(addr)) < 0) {
-		perror("bind");
-		exit(1);
-	}
-	return fd;
-}
+// The datagram wire under shove. A server's wire names each sender with an address string; a
+// client's wire has one far end, the server, and ignores addresses.
+struct Wire {
+	virtual ~Wire() {}
+	// One waiting datagram, or false when none is.
+	virtual bool receive(std::vector<uint8_t> &pkt, std::string &from) = 0;
+	virtual void send(const std::string &to, const uint8_t *data, size_t size) = 0;
+	// Until a datagram may be waiting, or `ms` has passed.
+	virtual void wait(int ms) = 0;
+	// What each datagram costs below goldnet's packet, for its budget.
+	virtual uint32_t overhead() const = 0;
+};
 
-inline bool resolve(const char *host, uint16_t port, sockaddr_in &out) {
-	addrinfo hints = {}, *res = nullptr;
-	hints.ai_family = AF_INET;
-	hints.ai_socktype = SOCK_DGRAM;
-	if (getaddrinfo(host, nullptr, &hints, &res) != 0 || !res) {
-		return false;
+class UdpWire : public Wire {
+public:
+	// A server's wire on `port`, or a client's on any port when `server` is given.
+	explicit UdpWire(uint16_t port, const sockaddr_in *server = nullptr) {
+		fd = socket(AF_INET, SOCK_DGRAM, 0);
+		if (fd < 0) {
+			perror("socket");
+			exit(1);
+		}
+		sockaddr_in addr = {};
+		addr.sin_family = AF_INET;
+		addr.sin_addr.s_addr = htonl(INADDR_ANY);
+		addr.sin_port = htons(port);
+		if (bind(fd, (sockaddr *)&addr, sizeof(addr)) < 0) {
+			perror("bind");
+			exit(1);
+		}
+		if (server) {
+			far = *server;
+			client = true;
+		}
 	}
-	out = *(sockaddr_in *)res->ai_addr;
-	out.sin_port = htons(port);
-	freeaddrinfo(res);
-	return true;
-}
+	~UdpWire() override { close(fd); }
 
-inline void wait_readable(int fd, int ms) {
-	pollfd p = { fd, POLLIN, 0 };
-	poll(&p, 1, ms < 0 ? 0 : ms);
-}
+	// A client's wire to `host`, or null when it doesn't resolve.
+	static std::unique_ptr<Wire> to(const char *host, uint16_t port) {
+		addrinfo hints = {}, *res = nullptr;
+		hints.ai_family = AF_INET;
+		hints.ai_socktype = SOCK_DGRAM;
+		if (getaddrinfo(host, nullptr, &hints, &res) != 0 || !res) {
+			return nullptr;
+		}
+		sockaddr_in server = *(sockaddr_in *)res->ai_addr;
+		server.sin_port = htons(port);
+		freeaddrinfo(res);
+		return std::make_unique<UdpWire>(0, &server);
+	}
 
-inline std::string addr_key(const sockaddr_in &a) {
-	char buf[64];
-	snprintf(buf, sizeof(buf), "%s:%d", inet_ntoa(a.sin_addr), ntohs(a.sin_port));
-	return buf;
-}
+	bool receive(std::vector<uint8_t> &pkt, std::string &from) override {
+		uint8_t buf[1500];
+		sockaddr_in addr;
+		socklen_t len = sizeof(addr);
+		const ssize_t n = recvfrom(fd, buf, sizeof(buf), MSG_DONTWAIT, (sockaddr *)&addr, &len);
+		if (n <= 0) {
+			return false;
+		}
+		pkt.assign(buf, buf + n);
+		if (!client) {
+			char key[64];
+			snprintf(key, sizeof(key), "%s:%d", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+			from = key;
+			senders[from] = addr;
+		}
+		return true;
+	}
+
+	void send(const std::string &to, const uint8_t *data, size_t size) override {
+		const sockaddr_in *addr = &far;
+		if (!client) {
+			auto it = senders.find(to);
+			if (it == senders.end()) {
+				return;
+			}
+			addr = &it->second;
+		}
+		sendto(fd, data, size, 0, (const sockaddr *)addr, sizeof(*addr));
+	}
+
+	void wait(int ms) override {
+		pollfd p = { fd, POLLIN, 0 };
+		poll(&p, 1, ms < 0 ? 0 : ms);
+	}
+
+	uint32_t overhead() const override { return 28; } // IPv4 + UDP
+
+private:
+	int fd = -1;
+	bool client = false;
+	sockaddr_in far = {};
+	std::map<std::string, sockaddr_in> senders; // grows by one entry per address ever heard from
+};
+
+// Makes main()'s wires: UDP here, another transport in a host that overrides these.
+struct Wires {
+	virtual ~Wires() {}
+	// An option main() doesn't know, with its value; false if this doesn't know it either.
+	virtual bool option(const std::string &, const char *) { return false; }
+	// Usage lines for those options.
+	virtual const char *usage() const { return ""; }
+	// `remote`: whether clients in other processes may join, which bench mode never has.
+	virtual std::unique_ptr<Wire> server(uint16_t port, bool remote) {
+		(void)remote;
+		return std::make_unique<UdpWire>(port);
+	}
+	// Null when `host` can't be reached.
+	virtual std::unique_ptr<Wire> client(const std::string &host, uint16_t port) {
+		return UdpWire::to(host.c_str(), port);
+	}
+};
 
 } // namespace shove
