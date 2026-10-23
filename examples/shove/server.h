@@ -50,7 +50,7 @@ inline const std::vector<uint8_t> &block_quant() {
 
 struct ServerApp {
 	struct Outgoing {
-		sockaddr_in to;
+		std::string to;
 		std::vector<uint8_t> bytes;
 	};
 	typedef goldnet::Server<Value> GServer;
@@ -73,12 +73,12 @@ struct ServerApp {
 		vec3 home;
 	};
 	struct Peer {
-		sockaddr_in addr;
+		std::string addr;
 		uint32_t last_heard = 0;
 		uint32_t player = 0;
 	};
 
-	int fd = -1;
+	std::unique_ptr<Wire> wire;
 	Sim sim;
 	GServer server;
 	NetSim<Outgoing> netsim;
@@ -182,7 +182,7 @@ struct ServerApp {
 	}
 
 	void transmit(const Outgoing &o) {
-		sendto(fd, o.bytes.data(), o.bytes.size(), 0, (const sockaddr *)&o.to, sizeof(o.to));
+		wire->send(o.to, o.bytes.data(), o.bytes.size());
 	}
 
 	void broadcast_reliable(const uint8_t *data, size_t size) {
@@ -472,27 +472,26 @@ struct ServerApp {
 	}
 
 	void receive(uint32_t now) {
-		uint8_t buf[1500];
-		sockaddr_in from;
-		socklen_t len = sizeof(from);
-		ssize_t n;
-		while ((n = recvfrom(fd, buf, sizeof(buf), MSG_DONTWAIT, (sockaddr *)&from, &len)) > 0) {
-			const std::string key = addr_key(from);
-			auto it = by_addr.find(key);
+		std::vector<uint8_t> buf;
+		std::string from;
+		while (wire->receive(buf, from)) {
+			if (buf.empty()) {
+				continue;
+			}
+			auto it = by_addr.find(from);
 			if (buf[0] == 'H' && it == by_addr.end()) {
-				join(from, key, now);
+				join(from, now);
 			} else if (buf[0] == 'D' && it != by_addr.end()) {
 				drop_peer(it->second, "left");
 			} else if (buf[0] == 'U' && it != by_addr.end()) {
 				const int32_t peer = it->second;
 				peers[peer].last_heard = now;
-				server.receive_uplink(peer, buf + 1, (size_t)n - 1, *this, now_ms());
+				server.receive_uplink(peer, buf.data() + 1, buf.size() - 1, *this, now_ms());
 			}
-			len = sizeof(from);
 		}
 	}
 
-	void join(const sockaddr_in &from, const std::string &key, uint32_t now) {
+	void join(const std::string &from, uint32_t now) {
 		int humans = 0;
 		for (auto &kv : players) {
 			humans += kv.second.peer != 0;
@@ -504,7 +503,7 @@ struct ServerApp {
 		Peer &p = peers[peer];
 		p.addr = from;
 		p.last_heard = now;
-		by_addr[key] = peer;
+		by_addr[from] = peer;
 		// Make room by retiring a bot if the arena is full.
 		if ((int)players.size() >= MAX_PLAYERS) {
 			for (auto &kv : players) {
@@ -519,7 +518,7 @@ struct ServerApp {
 		put_u32_le(msg + 1, p.player);
 		server.queue_reliable(peer, msg, sizeof(msg));
 		if (verbose) {
-			printf("[server] peer %d joined from %s\n", peer, key.c_str());
+			printf("[server] peer %d joined from %s\n", peer, from.c_str());
 		}
 	}
 
@@ -530,23 +529,23 @@ struct ServerApp {
 		if (players.count(peers[peer].player)) {
 			remove_player(peers[peer].player);
 		}
-		by_addr.erase(addr_key(peers[peer].addr));
+		by_addr.erase(peers[peer].addr);
 		peers.erase(peer);
 		server.remove_peer(peer);
 		netsim.forget_link(peer);
 	}
 
-	void start(uint16_t port, int bots) {
-		fd = open_socket(port);
+	void start(std::unique_ptr<Wire> w, int bots) {
+		wire = std::move(w);
 		bots_wanted = bots;
 		build_arena(sim);
-		server.set_packet_overhead(28); // IPv4 + UDP
+		server.set_packet_overhead(wire->overhead());
 		server.set_snapshot_rate(TICK_HZ);
 		add_arena_blocks();
 		start_ms = next_tick = now_ms();
 		next_report = next_tick + 1000;
 		if (verbose) {
-			printf("[server] listening on udp %d with %d bots\n", port, bots);
+			printf("[server] up with %d bots\n", bots);
 		}
 	}
 
@@ -595,7 +594,7 @@ struct ServerApp {
 	int run() {
 		for (;;) {
 			const uint32_t next = poll();
-			wait_readable(fd, (int)(int32_t)(next - now_ms()));
+			wire->wait((int)(int32_t)(next - now_ms()));
 		}
 	}
 };

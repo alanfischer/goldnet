@@ -10,9 +10,11 @@ cmake --build build-shove --target shove
 build-shove/examples/shove host --bots 3 --latency 150 --loss 5
 ```
 
-Modes: `host` (a server and a window on it), `server` (no window), `client --host H`, and
-`bench`, which runs a server and scripted clients in one process and prints how well the
-prediction held up.
+Modes: `play` (the default: join the server at `--host`, or host one if none answers within
+`--wait` seconds), `host` (a server and a window on it), `server` (no window), `client --host H`,
+and `bench`, which runs a server and scripted clients in one process and prints how well the
+prediction held up. On a wire that can see other servers, a `play` host that's outranked by one
+closes its own game and joins that one, so players who start together end up in one game.
 
 What it does:
 
@@ -29,6 +31,9 @@ One hop detail that matters for prediction: hop averages the two bodies' frictio
 is frictionless and the blocks bring their own. With friction on the floor, the contact solver
 added friction to the player that depended on contact state the client can't rebuild after a
 reset, and the replay drifted by about a centimetre per snapshot.
+
+The wire is UDP. `shove::run` in `app.h` takes a `Wires` that makes it, so a host can run the same
+game over another transport.
 
 Known gaps: the rendering hasn't been looked at yet, a few percent of predicted throws are never
 claimed by the server, and knockback from hits isn't predicted.

@@ -124,8 +124,7 @@ struct ClientCore {
 		uint32_t at_ms;
 	};
 
-	int fd = -1;
-	sockaddr_in server_addr = {};
+	std::unique_ptr<Wire> wire;
 	Client<Value> client;
 	NetSim<std::vector<uint8_t>> up_sim, down_sim; // both legs of this client's link
 
@@ -308,15 +307,11 @@ struct ClientCore {
 		clock_set = false;
 		add_arena_blocks();
 		const uint8_t hello = 'H';
-		sendto(fd, &hello, 1, 0, (sockaddr *)&server_addr, sizeof(server_addr));
+		wire->send("", &hello, 1);
 	}
 
-	bool start(const char *host, uint16_t port) {
-		if (!resolve(host, port, server_addr)) {
-			fprintf(stderr, "[client] can't resolve %s\n", host);
-			return false;
-		}
-		fd = open_socket(0);
+	void start(std::unique_ptr<Wire> w) {
+		wire = std::move(w);
 		build_arena(sim);
 		me.body = make_player_body();
 		me.body->set_position(vec3(0.0f, 0.0f, -100.0f));
@@ -325,12 +320,23 @@ struct ClientCore {
 		new_session();
 		next_hello = now_ms() + 500;
 		next_stats = now_ms() + 1000;
-		return true;
+	}
+
+	// Starts over on another wire, or on none until the next rewire.
+	void rewire(std::unique_ptr<Wire> w) {
+		wire = std::move(w);
+		connected = false;
+		if (wire) {
+			new_session();
+			next_hello = now_ms() + 500;
+		}
 	}
 
 	void leave() {
 		const uint8_t bye = 'D';
-		sendto(fd, &bye, 1, 0, (sockaddr *)&server_addr, sizeof(server_addr));
+		if (wire) {
+			wire->send("", &bye, 1);
+		}
 	}
 
 	// A block of ours young enough to pass through us, as it does on the server.
@@ -349,8 +355,11 @@ struct ClientCore {
 	}
 
 	void transmit(const std::vector<uint8_t> &pkt) {
+		if (!wire) {
+			return;
+		}
 		cur.bytes_out += pkt.size();
-		sendto(fd, pkt.data(), pkt.size(), 0, (sockaddr *)&server_addr, sizeof(server_addr));
+		wire->send("", pkt.data(), pkt.size());
 	}
 
 	// A packet through one leg of the simulated link: dropped, delayed, or on its way now.
@@ -388,10 +397,13 @@ struct ClientCore {
 
 	// Network in and out. Call every frame.
 	void poll() {
-		uint8_t buf[1500];
-		ssize_t n;
-		while ((n = recvfrom(fd, buf, sizeof(buf), MSG_DONTWAIT, nullptr, nullptr)) > 0) {
-			through(down_sim, std::vector<uint8_t>(buf, buf + n), [&](std::vector<uint8_t> &p) { handle_snapshot(p); });
+		if (!wire) {
+			return;
+		}
+		std::vector<uint8_t> buf;
+		std::string from;
+		while (wire->receive(buf, from)) {
+			through(down_sim, std::move(buf), [&](std::vector<uint8_t> &p) { handle_snapshot(p); });
 		}
 		const uint32_t now = now_ms();
 		down_sim.pump(now, [&](std::vector<uint8_t> &p) { handle_snapshot(p); });
