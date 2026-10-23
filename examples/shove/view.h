@@ -8,6 +8,7 @@
 #include <raylib.h>
 #include <raymath.h>
 
+#include <functional>
 #include <string>
 
 namespace shove {
@@ -62,6 +63,8 @@ inline Vector3 rl(const vec3 &v) { return { v.x, v.y, v.z }; }
 struct View {
 	ClientCore &core;
 	ServerApp *local; // the in-process server, for host mode
+	std::function<void()> each_frame; // before the network, every frame
+	const char *waiting = "connecting...";
 	std::string screenshot;
 	int quit_after = 0;
 
@@ -344,7 +347,7 @@ struct View {
 		}
 
 		if (!core.connected) {
-			text("connecting...", w / 2 - 70, hgt / 2 - 10, 24, RAYWHITE);
+			text(waiting, w / 2 - MeasureText(waiting, 24) / 2, hgt / 2 - 10, 24, RAYWHITE);
 		} else if (core.me_ready && !core.me.alive) {
 			text("SHOVED", w / 2 - 60, hgt / 2 - 40, 40, { 255, 120, 90, 255 });
 		} else if (core.me_ready) {
@@ -362,9 +365,14 @@ struct View {
 				{ 200, 200, 200, 160 });
 	}
 
-	void run() {
+	// False when there's no window to be had (no display, or a locked screen).
+	bool run() {
 		SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
 		InitWindow(1280, 720, "shove - goldnet + hop");
+		if (!IsWindowReady()) {
+			fprintf(stderr, "[view] couldn't open a window\n");
+			return false;
+		}
 		SetTargetFPS(144);
 		lit = LoadShaderFromMemory(LIT_VS, LIT_FS);
 		loc_view_pos = GetShaderLocation(lit, "viewPos");
@@ -383,6 +391,9 @@ struct View {
 		while (!WindowShouldClose()) {
 			const float dt = fminf(GetFrameTime(), 0.25f);
 			t += dt;
+			if (each_frame) {
+				each_frame();
+			}
 			if (local) {
 				local->poll();
 			}
@@ -431,6 +442,7 @@ struct View {
 		}
 		UnloadShader(lit);
 		CloseWindow();
+		return true;
 	}
 };
 

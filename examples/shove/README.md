@@ -10,9 +10,11 @@ cmake --build build-shove --target shove
 build-shove/examples/shove host --bots 3 --latency 150 --loss 5
 ```
 
-Modes: `host` (a server and a window on it), `server` (no window), `client --host H`, and
-`bench`, which runs a server and scripted clients in one process and prints how well the
-prediction held up.
+Modes: `play` (the default: join the server at `--host`, or host one if none answers within
+`--wait` seconds), `host` (a server and a window on it), `server` (no window), `client --host H`,
+and `bench`, which runs a server and scripted clients in one process and prints how well the
+prediction held up. On a wire that can see other servers, a `play` host that's outranked by one
+closes its own game and joins that one, so players who start together end up in one game.
 
 What it does:
 

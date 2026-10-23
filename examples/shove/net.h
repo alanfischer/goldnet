@@ -119,6 +119,8 @@ struct Wire {
 	virtual void wait(int ms) = 0;
 	// What each datagram costs below goldnet's packet, for its budget.
 	virtual uint32_t overhead() const = 0;
+	// A server's wire: another server on it should be the one, so this one should stand down.
+	virtual bool outranked() const { return false; }
 };
 
 class UdpWire : public Wire {

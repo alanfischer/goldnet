@@ -2,6 +2,8 @@
 //
 // shove: goldnet + hop + raylib. Throw blocks, knock everyone else off the platform.
 //
+//   shove [play] [--host H] [--port N] [--wait S] [--bots N]         join a game, or host one if none
+//                turns up within S seconds (5); with no mode, this is the mode
 //   shove host   [--port N] [--bots N] [--latency MS] [--loss PCT]   a server and a window on it
 //   shove server [--port N] [--bots N]                               a server, no window
 //   shove client [--host H] [--port N] [--latency MS] [--loss PCT]   a window on someone's server
@@ -16,6 +18,7 @@
 #include "server.h"
 #include "view.h"
 
+#include <random>
 #include <string>
 
 namespace shove {
@@ -29,13 +32,15 @@ struct Options {
 	int loss = 0;
 	int clients = 2;
 	int seconds = 20;
+	int wait = 5;
 	std::string screenshot;
 	int frames = 0;
 };
 
 inline void usage(const Wires &wires) {
 	fprintf(stderr,
-			"usage: shove host   [--port N] [--bots N] [--latency MS] [--loss PCT]\n"
+			"usage: shove [play] [--host H] [--port N] [--wait S] [--bots N] [--latency MS] [--loss PCT]\n"
+			"       shove host   [--port N] [--bots N] [--latency MS] [--loss PCT]\n"
 			"       shove server [--port N] [--bots N]\n"
 			"       shove client [--host H] [--port N] [--latency MS] [--loss PCT]\n"
 			"       shove bench  [--clients N] [--seconds S] [--bots N] [--latency MS] [--loss PCT]\n%s",
@@ -141,14 +146,103 @@ inline int bench(const Options &o, Wires &wires) {
 	return connected == (int)clients.size() ? 0 : 1;
 }
 
-inline int run(int argc, char **argv, Wires &wires) {
-	if (argc < 2) {
-		usage(wires);
+// Play mode: a client looking for a server. If none answers in time it hosts one itself, and if
+// its server's wire is outranked by another server's it stands down and looks again. The wait is
+// jittered so that players who start together rarely both host.
+struct Play {
+	Wires &wires;
+	const Options &o;
+	ClientCore &core;
+	View &view;
+	std::unique_ptr<ServerApp> server;
+	uint32_t give_up_at = 0;
+	bool started = false;
+	bool was_connected = false;
+	std::mt19937 rng{ std::random_device()() };
+
+	Play(Wires &w, const Options &opts, ClientCore &c, View &v) : wires(w), o(opts), core(c), view(v) {}
+
+	bool look() {
+		std::unique_ptr<Wire> w = wires.client(o.host, o.port);
+		if (!w) {
+			return false;
+		}
+		if (started) {
+			core.rewire(std::move(w));
+		} else {
+			core.start(std::move(w));
+			started = true;
+		}
+		search();
+		return true;
 	}
+
+	void search() {
+		give_up_at = now_ms() + (uint32_t)o.wait * 1000 + std::uniform_int_distribution<uint32_t>(0, 2000)(rng);
+		view.waiting = "looking for a game...";
+	}
+
+	void host() {
+		printf("[play] no game found; hosting one\n");
+		core.rewire(nullptr);
+		server = std::make_unique<ServerApp>();
+		server->verbose = false;
+		server->start(wires.server(o.port, true), o.bots < 0 ? 3 : o.bots);
+		view.local = server.get();
+		core.rewire(wires.client("127.0.0.1", o.port));
+		view.waiting = "starting a game...";
+	}
+
+	void stand_down() {
+		printf("[play] another game outranks this one; joining it\n");
+		core.rewire(nullptr);
+		view.local = nullptr;
+		server.reset();
+		look();
+	}
+
+	void frame() {
+		if (was_connected && !core.connected && !server) {
+			search(); // lost the game: look for another before hosting
+		}
+		was_connected = core.connected;
+		if (!server && !core.connected && (int32_t)(now_ms() - give_up_at) >= 0) {
+			host();
+		} else if (server && server->wire->outranked()) {
+			stand_down();
+		}
+	}
+};
+
+inline int play(const Options &o, Wires &wires) {
+	static ClientCore core;
+	set_link(core, o.latency, o.loss);
+	View view(core, nullptr);
+	view.screenshot = o.screenshot;
+	view.quit_after = o.frames;
+	Play p(wires, o, core, view);
+	if (!p.look()) {
+		fprintf(stderr, "[client] can't reach %s\n", o.host.c_str());
+		return 1;
+	}
+	view.each_frame = [&p] { p.frame(); };
+	const bool shown = view.run();
+	core.leave();
+	core.rewire(nullptr);
+	return shown ? 0 : 1;
+}
+
+inline int run(int argc, char **argv, Wires &wires) {
 	setvbuf(stdout, nullptr, _IOLBF, 0);
 	Options o;
-	o.mode = argv[1];
-	for (int i = 2; i < argc; i++) {
+	int first = 2;
+	if (argc < 2 || argv[1][0] == '-') {
+		o.mode = "play";
+		first = 1;
+	} else {
+		o.mode = argv[1];
+	}
+	for (int i = first; i < argc; i++) {
 		const std::string a = argv[i];
 		if (i + 1 >= argc) {
 			usage(wires);
@@ -166,6 +260,8 @@ inline int run(int argc, char **argv, Wires &wires) {
 			o.loss = atoi(v);
 		} else if (a == "--clients") {
 			o.clients = atoi(v);
+		} else if (a == "--wait") {
+			o.wait = atoi(v);
 		} else if (a == "--seconds") {
 			o.seconds = atoi(v);
 		} else if (a == "--screenshot") { // save the frame after --frames frames, then quit
@@ -183,6 +279,9 @@ inline int run(int argc, char **argv, Wires &wires) {
 	}
 	if (o.mode == "bench") {
 		return bench(o, wires);
+	}
+	if (o.mode == "play") {
+		return play(o, wires);
 	}
 	if (o.mode != "host" && o.mode != "client") {
 		usage(wires);
@@ -206,9 +305,9 @@ inline int run(int argc, char **argv, Wires &wires) {
 	View view(core, local);
 	view.screenshot = o.screenshot;
 	view.quit_after = o.frames;
-	view.run();
+	const bool shown = view.run();
 	core.leave();
-	return 0;
+	return shown ? 0 : 1;
 }
 
 } // namespace shove

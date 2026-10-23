@@ -322,9 +322,21 @@ struct ClientCore {
 		next_stats = now_ms() + 1000;
 	}
 
+	// Starts over on another wire, or on none until the next rewire.
+	void rewire(std::unique_ptr<Wire> w) {
+		wire = std::move(w);
+		connected = false;
+		if (wire) {
+			new_session();
+			next_hello = now_ms() + 500;
+		}
+	}
+
 	void leave() {
 		const uint8_t bye = 'D';
-		wire->send("", &bye, 1);
+		if (wire) {
+			wire->send("", &bye, 1);
+		}
 	}
 
 	// A block of ours young enough to pass through us, as it does on the server.
@@ -343,6 +355,9 @@ struct ClientCore {
 	}
 
 	void transmit(const std::vector<uint8_t> &pkt) {
+		if (!wire) {
+			return;
+		}
 		cur.bytes_out += pkt.size();
 		wire->send("", pkt.data(), pkt.size());
 	}
@@ -382,6 +397,9 @@ struct ClientCore {
 
 	// Network in and out. Call every frame.
 	void poll() {
+		if (!wire) {
+			return;
+		}
 		std::vector<uint8_t> buf;
 		std::string from;
 		while (wire->receive(buf, from)) {
