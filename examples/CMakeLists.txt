@@ -26,7 +26,7 @@ if(GOLDNET_BUILD_SHOVE)
         else()
             FetchContent_Declare(hop
                 GIT_REPOSITORY https://github.com/alanfischer/hop.git
-                GIT_TAG b5078ffd31792e3260e30c1b6dfd91b66270f053)
+                GIT_TAG 1a2916849955123fecc4ed2cab06c5a3299088b0)
             FetchContent_MakeAvailable(hop)
         endif()
     endif()
