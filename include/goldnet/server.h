@@ -14,8 +14,10 @@
 // receive_uplink() and the netchan take only theirs. A packet from any other peer is dropped. Add
 // and remove peers between ticks, never from inside the host's callbacks.
 //
-// Entities. add_entity(key, net_id, layout) starts replicating one, and the layout says how its slots
-// go (EntityLayout); remove_entity(key) stops.
+// Entities. add_entity(net_id, layout) starts replicating one, and the layout says how its slots go
+// (EntityLayout); remove_entity(net_id) stops. An entity is known by its net_id everywhere: on the
+// wire, to the client, and in every call here. The host keeps its own map from a net_id to its object,
+// or holds the object in Entity::user.
 //
 // The host. tick() and receive_uplink() call back into an object the game passes them, with the methods
 // listed below. Deriving it from ServerHost (at the end of this file) leaves only read, encode and send
@@ -26,7 +28,8 @@
 //   void read(Entity &e, bool polled_only)      read the slot values, calling stamp() for each; when
 //                                               polled_only, skip the slots e.pushed() names
 //   bool visible(const Entity &e, int32_t peer) per-peer visibility of a live entity
-//   bool spawn_visible(uint64_t key, int32_t peer)  same, for a spawn record's visibility keys
+//   bool spawn_visible(uint32_t net_id, int32_t peer)  same, for an entity a spawn record names
+//                                               (SpawnRecord::entities), which may not be added yet
 //   void encode(Writer &w, const Entity &e, int slot, const V *base, uint32_t now_ms)
 //        slot's current value (e.value(slot)), as its change from base, the value the peer holds,
 //        or whole when base is null (always null for a slot the layout doesn't step). Client::apply's
@@ -35,23 +38,24 @@
 //
 // An entity's changed slots go as a mask, a flag saying whether they're whole, and their bytes
 // behind a length, so a client that can't decode them (an id it doesn't know) can step over them.
-// They're whole when the peer doesn't hold the entity at its baseline, or a changed stepped slot's
-// value at that baseline has left its history (SLOT_HISTORY); a whole entity also carries the
-// layout's kinds_check, so a client whose host would read its slots differently can refuse them.
+// They're whole, every slot of them, when the peer doesn't hold the entity at its baseline, or a
+// changed stepped slot's value at that baseline has left its history (SLOT_HISTORY); a whole entity
+// also carries the layout's kinds_check, so a client whose host would read its slots differently
+// can refuse them.
 //
 // Spawns. An entity the client already has (one loaded with the map, at the same net_id on both
 // ends) needs only add_entity. A runtime entity, which the client has no other way to know about,
 // is two registrations under one net_id, and the host makes both:
 //
 //   add_spawn(net_id, record)          tells each peer to create it; record.data is the host's recipe
-//   add_entity(key, net_id, layout)    streams its slot state, like any other entity
+//   add_entity(net_id, layout)         streams its slot state, like any other entity
 //
-// and when it's destroyed, despawn(net_id) and remove_entity(key). Calling both on the same tick
+// and when it's destroyed, despawn(net_id) and remove_entity(net_id). Calling both on the same tick
 // is fine: a snapshot carries its spawns ahead of its entity deltas. A spawn reaches a peer the
-// first time the entity is visible to it (see SpawnRecord::vis_keys), goes in that snapshot and
+// first time the entity is visible to it (see SpawnRecord::entities), goes in that snapshot and
 // the RELIABLE_BACKUP after it, then again whenever it is overdue, until the peer acks a snapshot
 // carrying it; the despawn reaches only peers that got it, the same way. Until a spawn is proven
-// delivered, the entity at its net_id and the entities in its vis_keys don't count as held by the
+// delivered, the entity at its net_id and the entities it names don't count as held by the
 // peer, so each snapshot sends them whole: a client that missed the spawn discards their deltas,
 // and acking those must not leave the server believing it has them.
 //
@@ -82,6 +86,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -104,7 +109,7 @@ struct EntityLayout {
 	// costs a read instead of silently desyncing it for every peer. Empty means all polled; one
 	// that doesn't line up with the slots declares nothing.
 	std::vector<uint8_t> push;
-	// Peer-invariant importance weight for priority-ordered overflow (see PeerRing::stale_since
+	// Peer-invariant importance weight for priority-ordered overflow (see PeerRing::waits
 	// and SAFE_PACKET_BYTES).
 	float priority = 1.0f;
 	// The host's summary of how it codes this entity's slots (see encode), sent with every whole
@@ -117,8 +122,7 @@ class Server {
 public:
 	class Entity {
 	public:
-		uint64_t key() const { return key_; }       // the host's identity for it (stable for the entity's life)
-		uint32_t net_id() const { return net_id_; } // its identity on the wire, identical on server and client
+		uint32_t net_id() const { return net_id_; } // its identity, the same on the wire and on both ends
 		int slots() const { return layout_.slots; }
 		// Slot s's latest value, as read() last stamped it.
 		const V &value(int p_slot) const { return vals_[p_slot]; }
@@ -134,7 +138,6 @@ public:
 		// The layout codes slot s against the peer's baseline value.
 		bool stepped(int p_slot) const { return (size_t)p_slot < layout_.stepped.size() && layout_.stepped[p_slot]; }
 
-		uint64_t key_ = 0;
 		uint32_t net_id_ = 0;
 		EntityLayout layout_;
 		// Push-based change notification. Starts true so an entity is read once when it registers —
@@ -144,6 +147,9 @@ public:
 		// True when at least one slot is undeclared and so must be read on a tick where the entity
 		// was not marked. Entities that declare every slot skip the poll.
 		bool has_polled_ = true;
+		// The snapshot counter at add_entity's next tick: a baseline older than this holds some earlier
+		// entity at the same net_id, if any, never this one.
+		uint32_t added_ctr_ = 0;
 		// Change tracking, stamped ONCE per snapshot tick. The values an entity holds are the same
 		// for every peer, so "did slot s change" is answered once here rather than re-derived per
 		// peer. vals_ is the latest read; slot_ctr_[s] is the snapshot counter at which slot s last
@@ -161,30 +167,31 @@ public:
 
 	// A runtime entity's creation record, replayed to each peer the first time the entity is
 	// visible to it. spawner_net_id names what creates it on the client (0 = none) and goes on the
-	// wire with data, which is opaque to the protocol. vis_keys are the keys to ask spawn_visible()
-	// about, and the entities beyond the one at the spawn's net_id that the spawn creates.
+	// wire with data, which is opaque to the protocol.
 	struct SpawnRecord {
 		uint32_t spawner_net_id = 0;
 		std::vector<uint8_t> data;
-		// Empty ⇒ no visibility info ⇒ send to everyone (fail open).
-		std::vector<uint64_t> vis_keys;
+		// The entities the spawn creates beyond the one at its own net_id, by net_id: what
+		// spawn_visible() is asked about. Empty ⇒ no visibility info ⇒ send to everyone (fail open).
+		std::vector<uint32_t> entities;
 	};
 
 	// --- Entities ---
 
-	// Start replicating an entity: p_key is the host's identity for it, p_net_id its identity on the
-	// wire (the same on both ends), p_layout how its slots go. A key already added is replaced.
-	Entity &add_entity(uint64_t p_key, uint32_t p_net_id, EntityLayout p_layout) {
-		auto it = index_.find(p_key);
+	// Start replicating an entity: p_net_id is its identity (the same on both ends), p_layout how its
+	// slots go. A net_id already added is replaced. The reference, like find()'s pointer, lasts until
+	// the next add_entity or remove_entity.
+	Entity &add_entity(uint32_t p_net_id, EntityLayout p_layout) {
+		auto it = index_.find(p_net_id);
 		Entity *e;
 		if (it != index_.end()) {
 			e = &ents_[it->second];
 			*e = Entity();
 		} else {
-			index_[p_key] = ents_.size();
+			index_[p_net_id] = ents_.size();
 			e = &ents_.emplace_back();
 		}
-		e->key_ = p_key;
+		order_stale_ = true;
 		e->net_id_ = p_net_id;
 		EntityLayout &l = e->layout_;
 		l = std::move(p_layout);
@@ -196,16 +203,17 @@ public:
 		l.push.resize(l.push.empty() ? 0 : l.slots);
 		e->has_polled_ = l.push.empty() || std::find(l.push.begin(), l.push.end(), 0) != l.push.end();
 		e->vals_.assign(l.slots, V());
-		// Newer than any frame sent so far, so a peer that held an entity at this net_id before (a key
+		// Newer than any frame sent so far, so a peer that held an entity at this net_id before (one
 		// added again) is sent every slot, even one that reads as the default.
-		e->slot_ctr_.assign(l.slots, ctr_ + 1);
+		e->added_ctr_ = ctr_ + 1;
+		e->slot_ctr_.assign(l.slots, e->added_ctr_);
 		e->history_.assign(l.slots, {});
 		return *e;
 	}
 
 	// Order-preserving, so the packet order of everything else is unaffected.
-	bool remove_entity(uint64_t p_key) {
-		auto it = index_.find(p_key);
+	bool remove_entity(uint32_t p_net_id) {
+		auto it = index_.find(p_net_id);
 		if (it == index_.end()) {
 			return false;
 		}
@@ -217,19 +225,23 @@ public:
 				kv.second--;
 			}
 		}
+		for (auto &kv : rings_) {
+			erase_wait(kv.second, p_net_id);
+		}
+		order_stale_ = true;
 		return true;
 	}
 
-	Entity *find(uint64_t p_key) {
-		auto it = index_.find(p_key);
+	Entity *find(uint32_t p_net_id) {
+		auto it = index_.find(p_net_id);
 		return it == index_.end() ? nullptr : &ents_[it->second];
 	}
 
 	const std::vector<Entity> &entities() const { return ents_; }
 
 	// The next tick reads this entity's declared (pushed) slots too. False if it isn't registered.
-	bool mark_dirty(uint64_t p_key) {
-		Entity *e = find(p_key);
+	bool mark_dirty(uint32_t p_net_id) {
+		Entity *e = find(p_net_id);
 		if (!e) {
 			return false;
 		}
@@ -278,7 +290,7 @@ public:
 			}
 			pr.spawn_wait.erase(p_net_id);  // stop resending the (now void) spawn
 			pr.spawn_acked.erase(p_net_id); // and forget delivery, so a reused id re-spawns cleanly
-			pr.stale_since.erase(p_net_id); // and stop tracking overflow-priority for a dead entity
+			erase_wait(pr, p_net_id);       // and stop tracking overflow-priority for a dead entity
 		}
 		if (!needers.empty()) { // joining any peers still owed an earlier use of the id
 			despawn_pending_[p_net_id].insert(needers.begin(), needers.end());
@@ -316,6 +328,14 @@ public:
 	bool has_peer(int32_t p_peer) const { return rings_.count(p_peer) > 0; }
 	// The peers added, in the order they were, which is the order tick() serves them in.
 	const std::vector<int32_t> &peers() const { return peers_; }
+
+	// How long p_peer has gone without an uplink packet, ms: since its last one, or since tick() first
+	// served it if none has come. What a host times a quiet peer out on (GoldSrc's sv_timeout). 0 for
+	// a peer not added, or not served yet.
+	uint32_t silent_ms(int32_t p_peer, uint32_t p_now) const {
+		auto it = rings_.find(p_peer);
+		return it == rings_.end() || !it->second.heard ? 0 : p_now - it->second.heard_ms;
+	}
 
 	// A peer's link, as the server sees it. All zeros for a peer not added.
 	struct PeerStats {
@@ -414,8 +434,9 @@ public:
 		return it != rings_.end() && it->second.dgram.queue(p_data, p_size);
 	}
 
-	// Opt-in relevance events: the server sends leave markers for entities that drop out of a
-	// peer's PVS. Off by default so the protocol stays pure state replication.
+	// Relevance events: a leave marker for each entity that drops out of a peer's PVS (visible() turns
+	// false), which the client hands its host's relevance_lost(). On by default, as GoldSrc always told
+	// a client what left its PVS; off, a leave sends nothing and the client keeps the entity as it was.
 	void set_relevance_events(bool p_enabled) { relevance_events_ = p_enabled; }
 	bool relevance_events() const { return relevance_events_; }
 
@@ -424,13 +445,19 @@ public:
 	void tick(Host &p_host, uint32_t p_now);
 
 private:
-	// A stepped slot's value as of counter p_ctr, or null if that has left its history.
+	// A stepped slot's value as of counter p_ctr, or null if that has left its history or the
+	// baseline predates the entity. With no change recorded at or before p_ctr and the history never
+	// full, the slot hadn't moved from where every entity's slots start, V().
 	static const V *value_at(const Entity &p_e, int p_slot, uint32_t p_ctr) {
+		static const V initial{};
+		if (p_ctr < p_e.added_ctr_) {
+			return nullptr;
+		}
 		const typename Entity::History &h = p_e.history_[p_slot];
 		const size_t n = h.ring.size();
 		const size_t oldest = n < (size_t)SLOT_HISTORY ? 0 : h.next;
 		if (n == 0 || h.ring[oldest].first > p_ctr) {
-			return nullptr;
+			return n < (size_t)SLOT_HISTORY ? &initial : nullptr;
 		}
 		for (size_t i = 1; i <= n; i++) {
 			const std::pair<uint32_t, V> &entry = h.ring[(oldest + n - i) % n];
@@ -495,13 +522,27 @@ private:
 	// slot_ctr answers "did this change since the peer's baseline" directly. All a frame has to
 	// remember is WHICH entities the peer had, so a re-entering entity still gets a full state
 	// rather than a delta against something it never received.
+	//
+	// A sorted vector rather than a hash set: tick() walks the live entities in net_id order, so a
+	// frame comes out sorted as it's built, a lookup is a binary search, and a frame is refilled or
+	// copied in place, without the allocation per id a hash set costs every peer every tick.
+	struct IdList {
+		std::vector<uint32_t> ids;
+		size_t count(uint32_t p_id) const { return std::binary_search(ids.begin(), ids.end(), p_id) ? 1 : 0; }
+		std::vector<uint32_t>::const_iterator begin() const { return ids.begin(); }
+		std::vector<uint32_t>::const_iterator end() const { return ids.end(); }
+		void clear() { ids.clear(); }
+	};
 	typedef std::unordered_set<uint32_t> IdSet;
 
 	// Per-peer send history. Each new frame deltas against the frame the peer last acked; the
 	// ring lets a promoted ack become the next baseline and lets a lost ack self-heal (we keep
 	// diffing against the same acked frame). frame_seq[] guards against a stale (aged-out) slot.
 	struct PeerRing {
-		IdSet frames[RING];
+		IdList frames[RING];
+		// The entities each frame keeps only because the leave cap held their leave back: the peer
+		// holds them, but at whatever it last had, so one seen again goes whole. Usually empty.
+		IdList carried[RING];
 		uint16_t frame_seq[RING] = {}; // 0 = empty
 		// The monotonic snapshot counter each frame was sent at. The wire seq stays per-peer
 		// (16-bit, its own space), while change tracking needs a counter that never aliases: a slot
@@ -528,12 +569,12 @@ private:
 		// isn't acked, so `held` doesn't move and the same diff recomputes the same markers next
 		// tick — self-correcting, with no retry queue to leak or starve. Empty until the first ack,
 		// which is also why a joining peer gets no leave burst: it holds nothing yet.
-		IdSet held;
+		IdList held;
 		// Removals written since this peer's last ack. The peer has been told to drop these, but
 		// `held` won't reflect it until the frame carrying them is acked — so a re-entry inside that
 		// window must ship a full baseline, not a slot delta against a frame the peer no longer
 		// matches. Soft state: losing it only costs a redundant full baseline.
-		IdSet left_unacked;
+		IdList left_unacked;
 		uint32_t update_rate_asked = 0; // from the uplink; see PeerStats::update_rate
 		uint32_t update_rate = 0;       // granted, rounded, as the header carries it
 		// When this peer was last considered for a send, for the cadence check. Advances even on a
@@ -544,12 +585,16 @@ private:
 		// has to know how long the peer has really been without a header.
 		uint32_t last_packet_ms = 0;
 		bool sent = false; // last_packet_ms is set
-		// Priority-ordered overflow. net_id -> the snapshot counter this entity FIRST had an unsent
-		// pending change for THIS peer; cleared once it's actually written. The wait, weighted by
-		// EntityLayout::priority, scores entities when more changed this tick than fit in the budget — the
-		// most-overdue, highest-weighted entity goes first. Only a successful write resets it, not
-		// merely a later tick touching it again.
-		std::unordered_map<uint32_t, uint32_t> stale_since;
+		// When the peer's last uplink packet arrived, or tick() first served it; see silent_ms.
+		uint32_t heard_ms = 0;
+		bool heard = false; // heard_ms is set
+		// Priority-ordered overflow. (net_id, the snapshot counter this entity FIRST had an unsent
+		// pending change for THIS peer), sorted by net_id, until it's actually written. The wait,
+		// weighted by EntityLayout::priority, scores entities when more changed this tick than fit in
+		// the budget — the most-overdue, highest-weighted entity goes first. Only a successful write
+		// ends it, not merely a later tick touching it again. Sorted, so tick() reads and rewrites it
+		// walking the entities in net_id order, with no lookup per entity.
+		std::vector<std::pair<uint32_t, uint32_t>> waits;
 		// The newest command delivered with none missing before it, for the next header; 0 = none.
 		uint16_t cmd_ack = 0;
 		uint16_t cmd_ack_sent = 0; // what the last snapshot told the peer, so a new one earns a send
@@ -571,13 +616,22 @@ private:
 		size_t idx;
 		uint32_t net_id;
 		uint32_t mask;
+		uint32_t wait; // see PeerRing::waits; 0 = not waiting
 		float score;
 		bool holdable; // false while the entity's spawn isn't proven delivered to this peer
 		bool whole;    // its slots go whole rather than as their change from the peer's baseline
 	};
 
+	// p_net_id isn't waiting for the peer any more (see PeerRing::waits).
+	static void erase_wait(PeerRing &p_pr, uint32_t p_net_id) {
+		auto it = std::lower_bound(p_pr.waits.begin(), p_pr.waits.end(), std::make_pair(p_net_id, 0u));
+		if (it != p_pr.waits.end() && it->first == p_net_id) {
+			p_pr.waits.erase(it);
+		}
+	}
+
 	std::vector<Entity> ents_;
-	std::unordered_map<uint64_t, size_t> index_;
+	std::unordered_map<uint32_t, size_t> index_; // net_id -> its place in ents_
 	std::unordered_map<uint32_t, SpawnRecord> spawns_;
 	// Despawns awaiting delivery: the peers that still need each one (reliable-until-acked); erased
 	// once every such peer acks a frame carrying it.
@@ -592,10 +646,26 @@ private:
 	uint32_t ctr_ = 0;
 	int packet_overhead_ = 0;
 	double snapshot_rate_ = 0.0;
-	bool relevance_events_ = false;
-	std::vector<size_t> live_; // scratch: entities live this tick
-	std::unordered_set<uint64_t> unproven_; // scratch: entity keys whose spawn this peer may lack
-	std::unordered_set<uint32_t> unproven_ids_; // scratch: the same, by the spawn's own net_id
+	bool relevance_events_ = true;
+	std::vector<size_t> live_; // scratch: entities live this tick, in ents_ order
+	// live_ in net_id order, which each peer's frame is built in; sorted again only when live_ or the
+	// entities change.
+	std::vector<size_t> order_;
+	std::vector<size_t> order_live_; // the live_ order_ was sorted from
+	bool order_stale_ = true;
+	// Per-tick and per-peer scratch, kept so their capacity outlives the tick: tick() allocates
+	// nothing once the session has warmed up.
+	std::vector<int32_t> due_;
+	std::vector<uint32_t> unproven_; // net_ids, sorted, whose spawn this peer may lack
+	std::vector<Candidate> candidates_; // in net_id order
+	std::vector<uint64_t> rank_;        // candidates_ by score, as (inverted score << 32 | index)
+	std::vector<std::pair<uint32_t, uint32_t>> waits_kept_; // the next PeerRing::waits, being built
+	IdList visible_;                 // the frame's visible entities, for leaves
+	std::vector<uint32_t> included_; // the frame's entities the peer holds without a write, sorted
+	std::vector<uint32_t> written_;  // and those written this snapshot
+	std::vector<uint32_t> leaving_, carried_, merged_;
+	std::vector<uint8_t> block_;
+	Writer spawn_body_, despawn_body_, leave_body_, body_, slot_bytes_, packet_;
 
 	// See PeerStats::update_rate. 0 = every tick.
 	double grant(const PeerRing &p_pr) const {
@@ -646,6 +716,10 @@ Result Server<V, X>::receive_uplink(int32_t p_peer, const uint8_t *p_data, size_
 	Router router{ *this, p_host, p_now };
 	const Result res = uplink_.receive(p_peer, p_data, p_size, router, p_now);
 	PeerRing &pr = rit->second;
+	if (res) {
+		pr.heard = true;
+		pr.heard_ms = p_now;
+	}
 	pr.cmd_ack = uplink_.ack(p_peer);
 	pr.cmd_news = pr.cmd_news || uplink_.take_news(p_peer);
 	pr.uplink = uplink_.channel_ack(p_peer);
@@ -665,9 +739,13 @@ void Server<V, X>::tick(Host &p_host, uint32_t p_now) {
 	// A peer never considered always sends — its first snapshot must not wait out an interval.
 	// A slower peer is due half a tick early, so clock jitter can't push it a whole tick late.
 	const double slack_ms = snapshot_rate_ > 0.0 ? 500.0 / snapshot_rate_ : 0.0;
-	std::vector<int32_t> due;
+	due_.clear();
 	for (int32_t peer : peers_) {
 		PeerRing &pr = rings_[peer];
+		if (!pr.heard) {
+			pr.heard = true; // silent_ms counts from its first tick until its first packet
+			pr.heard_ms = p_now;
+		}
 		const double hz = grant(pr);
 		pr.update_rate = (uint32_t)std::lround(hz);
 		const bool gated = hz > 0.0 && !(snapshot_rate_ > 0.0 && hz >= snapshot_rate_);
@@ -678,9 +756,9 @@ void Server<V, X>::tick(Host &p_host, uint32_t p_now) {
 			pr.chokes++;
 			continue;
 		}
-		due.push_back(peer);
+		due_.push_back(peer);
 	}
-	if (due.empty()) {
+	if (due_.empty()) {
 		return;
 	}
 
@@ -706,10 +784,14 @@ void Server<V, X>::tick(Host &p_host, uint32_t p_now) {
 		}
 		live_.push_back(i);
 	}
+	if (order_stale_ || live_ != order_live_) {
+		order_live_ = live_;
+		order_ = live_;
+		std::sort(order_.begin(), order_.end(), [this](size_t a, size_t b) { return ents_[a].net_id_ < ents_[b].net_id_; });
+		order_stale_ = false;
+	}
 
-	std::vector<Candidate> candidates;
-	Writer vals; // one entity's slot bytes, reused so its capacity outlives the entity
-	for (int32_t peer : due) {
+	for (int32_t peer : due_) {
 		PeerRing &pr = rings_[peer];
 		pr.last_sent_ms = p_now;
 		pr.considered = true;
@@ -717,13 +799,15 @@ void Server<V, X>::tick(Host &p_host, uint32_t p_now) {
 		// Baseline = the frame this peer last acked, if we still hold it. Otherwise send a full
 		// frame (baseline seq 0) — first send, or an ack aged out of the ring under heavy loss.
 		uint16_t base_seq = 0;
-		const IdSet *base = nullptr;
+		const IdList *base = nullptr;
+		const IdList *base_carried = nullptr;
 		uint32_t base_ctr = 0;
 		if (pr.has_ack) {
 			const int bslot = pr.last_acked & (RING - 1);
 			if (pr.frame_seq[bslot] == pr.last_acked && pr.last_acked != 0) {
 				base_seq = pr.last_acked;
 				base = &pr.frames[bslot];
+				base_carried = &pr.carried[bslot];
 				base_ctr = pr.frame_ctr[bslot];
 			}
 		}
@@ -734,30 +818,28 @@ void Server<V, X>::tick(Host &p_host, uint32_t p_now) {
 
 		// The reliable block first: it has the packet before anything else. One written here always
 		// goes, since it makes the snapshot non-empty.
-		std::vector<uint8_t> block;
-		const uint8_t block_flags = pr.rel.write(seq, block);
+		const uint8_t block_flags = pr.rel.write(seq, block_);
 		const ChannelAck up = pr.uplink.at(p_now);
 
 		// Spawns owed to this peer, reliable-until-acked.
-		Writer spawn_body;
+		spawn_body_.clear();
 		uint16_t spawn_ct = 0;
 		const uint32_t overdue = overdue_ms(pr.srtt_ms);
 		unproven_.clear();
-		unproven_ids_.clear();
 		for (const auto &kv : spawns_) {
 			if (pr.spawn_acked.count(kv.first)) {
 				continue; // peer already has this node — don't re-arm the spawn every frame
 			}
-			unproven_.insert(kv.second.vis_keys.begin(), kv.second.vis_keys.end());
-			unproven_ids_.insert(kv.first);
+			unproven_.insert(unproven_.end(), kv.second.entities.begin(), kv.second.entities.end());
+			unproven_.push_back(kv.first);
 			// Lazy spawn (GoldSrc): defer sending the spawn to this peer until the entity is visible
 			// to it — created client-side the first time it enters your PVS. Once delivered it
 			// PERSISTS (spawn_acked keeps it; despawn only on server-free), so there's no
 			// create/destroy churn as it moves in and out of view.
-			if (!kv.second.vis_keys.empty()) {
+			if (!kv.second.entities.empty()) {
 				bool visible = false;
-				for (uint64_t vk : kv.second.vis_keys) {
-					if (p_host.spawn_visible(vk, peer)) {
+				for (uint32_t id : kv.second.entities) {
+					if (p_host.spawn_visible(id, peer)) {
 						visible = true;
 						break;
 					}
@@ -774,13 +856,16 @@ void Server<V, X>::tick(Host &p_host, uint32_t p_now) {
 			if (!owe_include(pr.spawn_wait, kv.first, seq, p_now, overdue, RELIABLE_BACKUP)) {
 				continue;
 			}
-			spawn_body.put_u32(kv.first);
-			spawn_body.put_u32(kv.second.spawner_net_id);
-			spawn_body.put_u32((uint32_t)kv.second.data.size());
-			spawn_body.put_data(kv.second.data.data(), kv.second.data.size());
+			spawn_body_.put_u32(kv.first);
+			spawn_body_.put_u32(kv.second.spawner_net_id);
+			spawn_body_.put_u32((uint32_t)kv.second.data.size());
+			spawn_body_.put_data(kv.second.data.data(), kv.second.data.size());
 			spawn_ct++;
 		}
-		Writer despawn_body;
+		if (!unproven_.empty()) {
+			std::sort(unproven_.begin(), unproven_.end());
+		}
+		despawn_body_.clear();
 		uint16_t despawn_ct = 0;
 		for (auto &kv : despawn_pending_) {
 			if (!kv.second.count(peer)) {
@@ -789,39 +874,58 @@ void Server<V, X>::tick(Host &p_host, uint32_t p_now) {
 			if (!owe_include(pr.despawn_wait, kv.first, seq, p_now, overdue, RELIABLE_BACKUP)) {
 				continue; // not due again yet; on_ack drops the peer once it's proven delivered
 			}
-			despawn_body.put_u32(kv.first);
+			despawn_body_.put_u32(kv.first);
 			despawn_ct++;
 		}
 
 		// Per-peer entity delta: filter by visibility, store the visible subset as this peer's next
 		// baseline, and emit only the changed slots.
 		//
-		// Two sets, not one. `frame` is visibility this tick — every entity the peer can currently
+		// Two sets, not one. `visible_` is visibility this tick — every entity the peer can currently
 		// see, used for PVS-leave detection, regardless of whether its bytes fit on the wire.
-		// `included` is the peer's actual reconstructed state after this packet — only entities
-		// whose current value the peer truly has (unchanged-so-nothing-to-send, or successfully
-		// written this tick). It becomes the baseline future deltas compare against, so a changed
-		// entity left out by the byte budget must NOT land in it: if it did, an ack of this seq
-		// would push base_ctr past that entity's slot_ctr and the change would never be resent. Left
-		// out of `included`, the same compare catches it again next tick — free retry.
-		IdSet frame;
-		IdSet included;
-		Writer body;
+		// The frame is the peer's actual reconstructed state after this packet — only entities
+		// whose current value the peer truly has (unchanged-so-nothing-to-send in `included_`, or
+		// successfully written this tick in `written_`). It becomes the baseline future deltas compare
+		// against, so a changed entity left out by the byte budget must NOT land in it: if it did, an
+		// ack of this seq would push base_ctr past that entity's slot_ctr and the change would never
+		// be resent. Left out, the same compare catches it again next tick — free retry.
+		visible_.clear();
+		included_.clear();
+		written_.clear();
+		body_.clear();
 		uint16_t changed = 0;
 
-		// Pass 1: visibility + mask for every entity. Unchanged entities are settled immediately;
-		// changed ones become overflow candidates, scored for pass 2.
-		candidates.clear();
+		// Pass 1: visibility + mask for every entity, in net_id order so the lists come out sorted.
+		// Unchanged entities are settled immediately; changed ones become overflow candidates,
+		// scored for pass 2.
+		candidates_.clear();
 		// Set when any candidate's score departs from the flat 1.0 default. While it stays false
-		// every score is identical and sorting is a no-op, so pass 2 skips it.
+		// every score is identical and pass 2 needn't sort.
 		bool needs_sort = false;
-		for (size_t idx : live_) {
+		// The peer's waits, walked alongside: one for an entity not seen here (not visible, or gone)
+		// stays as it is, and the rest are settled below.
+		const std::vector<std::pair<uint32_t, uint32_t>> &waits = pr.waits;
+		size_t wi = 0;
+		waits_kept_.clear();
+		for (size_t idx : order_) {
 			const Entity &e = ents_[idx];
+			const uint32_t net_id = e.net_id_;
+			while (wi < waits.size() && waits[wi].first < net_id) {
+				waits_kept_.push_back(waits[wi++]);
+			}
+			uint32_t since = 0;
+			if (wi < waits.size() && waits[wi].first == net_id) {
+				since = waits[wi++].second;
+			}
 			if (!p_host.visible(e, peer)) {
+				if (since != 0) {
+					waits_kept_.emplace_back(net_id, since);
+				}
 				continue;
 			}
-			const uint32_t net_id = e.net_id_;
-			frame.insert(net_id);
+			if (relevance_events_) {
+				visible_.ids.push_back(net_id);
+			}
 
 			// Did this peer hold this entity at its baseline? If not (first sight, or it left and
 			// re-entered the peer's PVS) it needs every slot. Otherwise a slot changed iff it was
@@ -832,10 +936,9 @@ void Server<V, X>::tick(Host &p_host, uint32_t p_now) {
 			uint32_t mask = 0;
 			bool whole = false;
 			const int n_vals = (int)e.vals_.size();
-			const bool holdable = !unproven_.count(e.key_) && !unproven_ids_.count(net_id);
-			if (!base || !base->count(net_id) || pr.left_unacked.count(net_id)) {
-				mask = n_vals >= MAX_SLOTS ? 0xFFFFFFFFu : ((1u << n_vals) - 1u); // new → all slots
-				whole = true;
+			const bool holdable = !std::binary_search(unproven_.begin(), unproven_.end(), net_id);
+			if (!base || !base->count(net_id) || pr.left_unacked.count(net_id) || base_carried->count(net_id)) {
+				whole = true; // new → all slots
 			} else {
 				// Every slot that changed since the baseline goes, even one back at the baseline's value:
 				// the client may have applied a newer frame since. One whose baseline value has left
@@ -847,29 +950,32 @@ void Server<V, X>::tick(Host &p_host, uint32_t p_now) {
 					}
 				}
 			}
+			if (whole) {
+				// Every slot: a whole entity replaces what the client holds, so a slot left out would
+				// come back as the client's default.
+				mask = n_vals >= MAX_SLOTS ? 0xFFFFFFFFu : ((1u << n_vals) - 1u);
+			}
 			if (mask == 0) {
 				if (holdable) {
-					included.insert(net_id); // peer's existing value is already correct
+					included_.push_back(net_id); // peer's existing value is already correct
 				}
-				pr.stale_since.erase(net_id); // no longer owed anything — clear any old overflow mark
-				continue;
+				continue; // no longer owed anything, so any old wait is dropped
 			}
 			// Score = how many ticks this entity has been waiting for THIS peer, weighted by its
-			// priority. Only read here — pass 2 commits a wait-start or clears one.
-			auto wit = pr.stale_since.find(net_id);
-			const uint32_t wait_ticks = wit != pr.stale_since.end() ? ctr_ - wit->second : 0;
+			// priority. Only read here — pass 2 starts a wait or ends one.
+			const uint32_t wait_ticks = since != 0 ? ctr_ - since : 0;
 			Candidate c;
 			c.idx = idx;
 			c.net_id = net_id;
 			c.mask = mask;
+			c.wait = since;
 			c.score = (float)(wait_ticks + 1) * e.layout_.priority;
 			c.whole = whole;
 			c.holdable = holdable;
-			if (c.score != 1.0f) {
-				needs_sort = true;
-			}
-			candidates.push_back(c);
+			needs_sort = needs_sort || c.score != 1.0f;
+			candidates_.push_back(c);
 		}
+		waits_kept_.insert(waits_kept_.end(), waits.begin() + wi, waits.end());
 
 		// Relevance leaves (opt-in), derived GoldSrc-style from the peer's acked baseline: every
 		// entity that baseline holds and this frame can't see gets a remove marker. Nothing is
@@ -877,81 +983,107 @@ void Server<V, X>::tick(Host &p_host, uint32_t p_now) {
 		// same markers. Enters need no event: an entering entity re-appears with a full baseline.
 		// Built before pass 2 because the entity budget is whatever the packet has left once every
 		// other section is built.
-		Writer leave_body;
+		leave_body_.clear();
 		uint16_t leave_ct = 0;
+		leaving_.clear();
+		carried_.clear();
 		if (relevance_events_) {
-			std::vector<uint32_t> leaving;
-			std::vector<uint32_t> carried;
-			derive_leaves(pr.held, frame, MAX_LEAVES_PER_SNAPSHOT, leaving, carried);
-			for (uint32_t id : leaving) {
-				leave_body.put_u32(id);
+			derive_leaves(pr.held, visible_, MAX_LEAVES_PER_SNAPSHOT, leaving_, carried_);
+			for (uint32_t id : leaving_) {
+				leave_body_.put_u32(id);
 				leave_ct++;
-				// Told to drop it, so it leaves this frame's baseline too — which is what makes a
-				// later re-entry a clean all-slots delta. Until the peer acks that, left_unacked
-				// covers the window where its own baseline still disagrees.
-				pr.left_unacked.insert(id);
 			}
-			// Held back by the cap: the peer still holds these, so they stay in the baseline and the
-			// next diff picks them up again. Dropping them here would lose the removal entirely.
-			for (uint32_t id : carried) {
-				included.insert(id);
+			// Told to drop them, so they leave this frame's baseline too — which is what makes a
+			// later re-entry a clean all-slots delta. Until the peer acks that, left_unacked covers
+			// the window where its own baseline still disagrees. Both lists are sorted (held is).
+			if (!leaving_.empty()) {
+				merged_.clear();
+				std::set_union(pr.left_unacked.ids.begin(), pr.left_unacked.ids.end(), leaving_.begin(), leaving_.end(),
+						std::back_inserter(merged_));
+				pr.left_unacked.ids.swap(merged_);
 			}
+			// Held back by the cap (carried_): the peer still holds these, so they stay in the
+			// baseline and the next diff picks them up again. Dropping them here would lose the
+			// removal entirely. Their values are only what the peer last had, which the frame
+			// records (PeerRing::carried).
 		}
 
 		// Pass 2: highest score first — the most-overdue, highest-weighted entity wins the budget.
-		// Stable, so equal scores keep registration order.
+		// Equal scores go in net_id order. Sorted as keys, a score's bits inverted over the
+		// candidate's index: a non-negative float's bits order the way it does.
+		rank_.clear();
+		for (size_t ci = 0; ci < candidates_.size(); ci++) {
+			uint32_t bits = 0;
+			if (needs_sort) {
+				const float score = candidates_[ci].score > 0.0f ? candidates_[ci].score : 0.0f;
+				memcpy(&bits, &score, sizeof(bits));
+			}
+			rank_.push_back((uint64_t)(0xFFFFFFFFu - bits) << 32 | ci);
+		}
 		if (needs_sort) {
-			std::stable_sort(candidates.begin(), candidates.end(),
-					[](const Candidate &a, const Candidate &b) { return a.score > b.score; });
+			std::sort(rank_.begin(), rank_.end());
 		}
 
 		// What's left of a safe UDP payload after the header and every section already built —
 		// measured, not estimated.
-		int peer_budget = SAFE_PACKET_BYTES - SNAPSHOT_HEADER_BYTES - (int)spawn_body.size()
-				- (int)despawn_body.size() - (int)leave_body.size();
-		peer_budget -= (int)block.size() + (up.fragments ? 2 : 0);
+		int peer_budget = SAFE_PACKET_BYTES - SNAPSHOT_HEADER_BYTES - (int)spawn_body_.size()
+				- (int)despawn_body_.size() - (int)leave_body_.size();
+		peer_budget -= (int)block_.size() + (up.fragments ? 2 : 0);
 		// Then the datagram, all of it or none, and the entities get the rest.
 		std::vector<uint8_t> datagram;
 		pr.dgram.take(peer_budget, datagram);
 		peer_budget -= (int)datagram.size();
 
-		for (size_t ci = 0; ci < candidates.size(); ci++) {
-			const Candidate &c = candidates[ci];
+		for (size_t ri = 0; ri < rank_.size(); ri++) {
+			Candidate &c = candidates_[rank_[ri] & 0xFFFFFFFFu];
 			// Past budget, leave this entity out (see `included` above for why that's safe) and mark
 			// it waiting so it outranks everything else next tick if it's still unlucky then.
 			//
-			// `ci > 0` makes the highest-scoring candidate unconditional, which guarantees forward
+			// `ri > 0` makes the highest-scoring candidate unconditional, which guarantees forward
 			// progress: a budget of zero or less (a spawn section that spent
 			// the whole MTU) would otherwise starve replication completely and silently. One entity of
 			// overrun beats a permanent stall, and it is self-limiting: the sections that crowded the
 			// budget out are reliable-until-acked, so they retire and the budget reopens.
-			if (ci > 0 && (int)body.size() >= peer_budget) {
-				if (!pr.stale_since.count(c.net_id)) {
-					pr.stale_since[c.net_id] = ctr_;
+			if (ri > 0 && (int)body_.size() >= peer_budget) {
+				if (c.wait == 0) {
+					c.wait = ctr_;
 				}
 				continue;
 			}
 			const Entity &e = ents_[c.idx];
-			vals.clear();
+			slot_bytes_.clear();
 			for (size_t s = 0; s < e.vals_.size(); s++) {
 				if (c.mask & (1u << s)) {
 					const bool from_base = !c.whole && e.stepped((int)s);
-					p_host.encode(vals, e, (int)s, from_base ? value_at(e, (int)s, base_ctr) : nullptr, p_now);
+					p_host.encode(slot_bytes_, e, (int)s, from_base ? value_at(e, (int)s, base_ctr) : nullptr, p_now);
 				}
 			}
-			body.put_u32(c.net_id);
-			put_uvarint(&body, c.mask); // most entities set only the low few bits — 1 byte, not 4
-			put_uvarint(&body, (uint32_t)(vals.size() << 1) | (c.whole ? 1u : 0u));
+			body_.put_u32(c.net_id);
+			put_uvarint(&body_, c.mask); // most entities set only the low few bits — 1 byte, not 4
+			put_uvarint(&body_, (uint32_t)(slot_bytes_.size() << 1) | (c.whole ? 1u : 0u));
 			if (c.whole) {
-				body.put_u8(e.layout_.kinds_check);
+				body_.put_u8(e.layout_.kinds_check);
 			}
-			body.put_data(vals);
+			body_.put_data(slot_bytes_);
 			if (c.holdable) {
-				included.insert(c.net_id);
+				written_.push_back(c.net_id);
 			}
-			pr.stale_since.erase(c.net_id); // delivered (pending ack) — no longer owed
+			c.wait = 0; // delivered (pending ack) — no longer owed
 			changed++;
 		}
+		// The waits for next time: those kept, and the candidates still waiting, both in net_id order.
+		pr.waits.clear();
+		size_t ki = 0;
+		for (const Candidate &c : candidates_) {
+			if (c.wait == 0) {
+				continue;
+			}
+			while (ki < waits_kept_.size() && waits_kept_[ki].first < c.net_id) {
+				pr.waits.push_back(waits_kept_[ki++]);
+			}
+			pr.waits.emplace_back(c.net_id, c.wait);
+		}
+		pr.waits.insert(pr.waits.end(), waits_kept_.begin() + ki, waits_kept_.end());
 
 		// Nothing to report: skip the header-only packet — except that the header carries
 		// server_time, the client's only clock feed, so "nothing to report" only earns a skip while
@@ -975,32 +1107,43 @@ void Server<V, X>::tick(Host &p_host, uint32_t p_now) {
 			pr.next_seq = 1; // 0 is reserved for "no baseline"
 		}
 
+		// The frame: the three sorted lists merged. Every read of the baseline is done, so its slot
+		// may be the one refilled.
 		const int slot = seq & (RING - 1);
-		pr.frames[slot] = std::move(included);
+		std::sort(written_.begin(), written_.end());
+		std::vector<uint32_t> &held_now = pr.frames[slot].ids;
+		held_now.clear();
+		std::merge(included_.begin(), included_.end(), written_.begin(), written_.end(), std::back_inserter(held_now));
+		if (!carried_.empty()) {
+			merged_.clear();
+			std::merge(held_now.begin(), held_now.end(), carried_.begin(), carried_.end(), std::back_inserter(merged_));
+			held_now.swap(merged_);
+		}
+		pr.carried[slot].ids.assign(carried_.begin(), carried_.end());
 		pr.frame_seq[slot] = seq;
 		pr.frame_ctr[slot] = ctr_;
 		pr.frame_ms[slot] = p_now;
 
-		Writer packet;
-		packet.put_u8(WIRE_VERSION);
-		packet.put_u16(seq);
-		packet.put_u16(base_seq);
-		packet.put_u32(p_now);
-		packet.put_u16(pr.cmd_ack);
-		put_uvarint(&packet, pr.uplink_lag_ms);
-		put_uvarint(&packet, pr.uplink_pps);
-		put_uvarint(&packet, pr.update_rate);
-		put_channel(packet, up, block_flags, block, datagram);
-		packet.put_u16(spawn_ct);
-		packet.put_data(spawn_body);
-		packet.put_u16(despawn_ct);
-		packet.put_data(despawn_body);
-		packet.put_u16(leave_ct);
-		packet.put_data(leave_body);
-		packet.put_u16(changed);
-		packet.put_data(body);
-		p_host.send(peer, packet);
-		charge(peer, packet.size() + (size_t)packet_overhead_, p_now);
+		packet_.clear();
+		packet_.put_u8(WIRE_VERSION);
+		packet_.put_u16(seq);
+		packet_.put_u16(base_seq);
+		packet_.put_u32(p_now);
+		packet_.put_u16(pr.cmd_ack);
+		put_uvarint(&packet_, pr.uplink_lag_ms);
+		put_uvarint(&packet_, pr.uplink_pps);
+		put_uvarint(&packet_, pr.update_rate);
+		put_channel(packet_, up, block_flags, block_, datagram);
+		packet_.put_u16(spawn_ct);
+		packet_.put_data(spawn_body_);
+		packet_.put_u16(despawn_ct);
+		packet_.put_data(despawn_body_);
+		packet_.put_u16(leave_ct);
+		packet_.put_data(leave_body_);
+		packet_.put_u16(changed);
+		packet_.put_data(body_);
+		p_host.send(peer, packet_);
+		charge(peer, packet_.size() + (size_t)packet_overhead_, p_now);
 	}
 }
 
@@ -1022,7 +1165,7 @@ struct ServerHost {
 	// Every entity added replicates, to every peer.
 	virtual bool live(Entity &) { return true; }
 	virtual bool visible(const Entity &, int32_t) { return true; }
-	virtual bool spawn_visible(uint64_t, int32_t) { return true; }
+	virtual bool spawn_visible(uint32_t, int32_t) { return true; }
 
 	// The uplink: no commands or messages taken, and a stream with no schema set on the server
 	// (Server::set_command_schema) is one FIELD_BYTES field, as it is on the client.

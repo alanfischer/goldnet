@@ -85,13 +85,14 @@ goldnet::Server<MyValue> server;
 server.set_packet_overhead(28);     // IPv4 + UDP, for rate budgets
 server.set_snapshot_rate(60);       // how often you call tick()
 
-server.add_entity(key, net_id, layout);  // starts replicating (EntityLayout: its slots); remove_entity(key)
+server.add_entity(net_id, layout);  // starts replicating (EntityLayout: its slots); remove_entity(net_id)
 server.add_spawn(net_id, record);   // a runtime entity clients must create; despawn(net_id)
-server.mark_dirty(key);             // a pushed slot was written (EntityLayout::push)
+server.mark_dirty(net_id);          // a pushed slot was written (EntityLayout::push)
 
 server.add_peer(peer);              // on connect; remove_peer(peer) on disconnect
 server.tick(host, now_ms);          // every tick: reads state, sends each due peer a snapshot
 server.peer_stats(peer);            // its rate, chokes, uplink report and netchan counts
+server.silent_ms(peer, now_ms);     // how long since it last sent anything: time a quiet one out
 
 server.set_command_schema(stream_id, schema);  // a command stream's fields, as the client names them
 server.receive_uplink(peer, bytes, size, host, now_ms);  // each uplink packet from a peer
@@ -124,6 +125,7 @@ if (client.uplink_due(now_ms)) {  // commands, messages, or an ack the server is
     client.write_uplink(w, now_ms);  // send w to the server
 }
 client.stats();                   // arrivals, lag, the rates in force, commands and messages
+client.silent_ms(now_ms);         // how long since a snapshot arrived: time a quiet server out
 ```
 
 The client's host:
@@ -149,8 +151,9 @@ default in place. The bases are optional: the server and client call whatever th
 handed has, so a host that defines every method needn't derive from anything. The contract for each
 method is at the top of `server.h` and `client.h`.
 
-Connection management (timeouts, saying hello, deciding who is a peer) is up to you; the server
-serves only the peers you add. Both examples show a
+Connection management (saying hello, deciding who is a peer, when to give up on one) is up to you;
+the server serves only the peers you add, and `silent_ms` on each end says how long the other has
+been quiet. Both examples show a
 minimal one over plain UDP.
 
 ## Examples

@@ -217,7 +217,7 @@ struct ServerApp : goldnet::ServerHost<Value> {
 		GServer::SpawnRecord rec;
 		rec.data = { KIND_PLAYER, p.color, (uint8_t)(peer == 0) };
 		server.add_spawn(id, rec);
-		server.add_entity(id, id, player_layout());
+		server.add_entity(id, player_layout());
 		return id;
 	}
 
@@ -277,7 +277,7 @@ struct ServerApp : goldnet::ServerHost<Value> {
 		rec.data = { KIND_BLOCK, owner.color, 0, 0, 0, 0, (uint8_t)throw_tick, (uint8_t)(throw_tick >> 8) };
 		put_u32_le(&rec.data[2], owner.net_id);
 		server.add_spawn(id, rec);
-		server.add_entity(id, id, block_layout());
+		server.add_entity(id, block_layout());
 	}
 
 	void hook_block(SBlock &b) {
@@ -325,7 +325,7 @@ struct ServerApp : goldnet::ServerHost<Value> {
 			b.body = make_block_body();
 			b.body->set_position(spot);
 			hook_block(b);
-			server.add_entity(id, id, block_layout()); // no spawn: the client has these from the start
+			server.add_entity(id, block_layout()); // no spawn: the client has these from the start
 			id++;
 		}
 	}

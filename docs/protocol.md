@@ -85,7 +85,7 @@ len bytes             spawn data, opaque to the protocol (Godot: var_to_bytes of
 ```
 
 **Despawn** and **leave** entries are a bare `u32 net_id`. A despawn destroys the entity; a leave
-(only sent when relevance events are on) says it dropped out of the peer's PVS. At most
+(sent unless the server turns relevance events off) says it dropped out of the peer's PVS. At most
 `MAX_LEAVES_PER_SNAPSHOT` = 32 leaves ride one snapshot.
 
 **Entity entry** — the slots of one entity that changed since `base_seq`:
@@ -101,9 +101,11 @@ A slot is an index into the entity's replicated properties — in Godot, the ord
 synchronizer's `SceneReplicationConfig`. At most `MAX_SLOTS` = 32: an entity declared with more
 replicates only the first 32. The slots' bytes are the host's:
 a slot the host declares stepped is coded against `base`, the value the peer holds for it at
-`base_seq`, unless `whole` is set, when there is no base. An entity goes whole when the peer doesn't
-hold it at the baseline, or when a changed stepped slot's value at the baseline has left the
-server's history of it (`SLOT_HISTORY` = 64 changes). The length lets a receiver step over an entity it doesn't know, or one whose
+`base_seq`, unless `whole` is set, when there is no base and every slot follows. An entity goes whole
+when the peer doesn't hold it at the baseline (including one it holds only because a leave was held
+back by the cap, at whatever values it last had), or when a changed stepped slot's value at the
+baseline has left the server's history of it (`SLOT_HISTORY` = 64 changes). A slot with no change
+recorded before the baseline is still at its starting value, the host's default. The length lets a receiver step over an entity it doesn't know, or one whose
 `kinds_check` doesn't match its own host's.
 
 ## Values
