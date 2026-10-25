@@ -402,6 +402,29 @@ static void test_lost_ack_resends_against_old_baseline() {
 	printf("  lost ack resends against the old baseline: ok\n");
 }
 
+// Frames share the values of entities they hold unchanged, so a change in a newer frame must leave
+// an older one as it was: with acks lost the server keeps coding against the older frame.
+static void test_older_frame_keeps_its_values() {
+	Net n;
+	Peer &p = n.add_peer(2);
+	n.add_entity(10, 100, { 10, 20 });
+	n.add_entity(11, 101, { 30 });
+	n.tick();
+	n.drop_acks.insert(2);
+	n.world.ents[10].vals[0] = 11; // a frame of its own, the client's newest
+	n.tick();
+	n.world.ents[10].vals[0] = 15; // coded against the first frame's 10, not the newer 11
+	n.world.ents[10].vals[1] = 21;
+	n.tick();
+	CHECK((p.vals[100] == std::vector<Val>{ 15, 21 }) && p.vals[101][0] == 30);
+	n.drop_acks.clear();
+	n.world.ents[11].vals[0] = 31;
+	n.tick();
+	n.tick();
+	CHECK((p.vals[100] == std::vector<Val>{ 15, 21 }) && p.vals[101][0] == 31);
+	printf("  an older frame keeps its values when a newer one changes them: ok\n");
+}
+
 static void test_aged_out_ack_falls_back_to_full_frame() {
 	Net n;
 	Peer &p = n.add_peer(2);
@@ -1657,6 +1680,7 @@ int main() {
 	test_clock_may_start_at_zero();
 	test_lost_snapshot_self_heals();
 	test_lost_ack_resends_against_old_baseline();
+	test_older_frame_keeps_its_values();
 	test_aged_out_ack_falls_back_to_full_frame();
 	test_unknown_baseline_is_dropped();
 	test_reordered_snapshot_is_dropped();
