@@ -85,9 +85,9 @@ len bytes             spawn data, opaque to the protocol
 ```
 
 goldnet-godot hands out its net_ids on the server, from 1, and tells clients what they name with
-spawn entries. One with a spawner is a spawn: its data is `uvarint n`, the `n` net_ids of the
-synchronizers the spawned node brings (depth first, as both ends find them in the built node), then
-`var_to_bytes` of the spawn's data. One with spawner 0 is a *bind*: its data is the UTF-8 path of a
+spawn entries. One with a spawner is a spawn: its data is `uvarint n`, then for each of the
+synchronizers the spawned node brings its `uvarint net_id` and its path from the node (`uvarint`
+length, UTF-8), then `var_to_bytes` of the spawn's data. One with spawner 0 is a *bind*: its data is the UTF-8 path of a
 node both ends already have (a synchronizer or a spawner placed in the scene), which the client
 binds to the net_id; its despawn unbinds it.
 
