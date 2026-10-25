@@ -48,6 +48,19 @@ inline const std::vector<uint8_t> &block_quant() {
 	return q;
 }
 
+inline EntityLayout player_layout() {
+	EntityLayout l;
+	l.slots = PLAYER_SLOTS;
+	l.priority = 4.0f; // players before blocks when a packet overflows
+	return l;
+}
+
+inline EntityLayout block_layout() {
+	EntityLayout l;
+	l.slots = BLOCK_SLOTS;
+	return l;
+}
+
 struct ServerApp : goldnet::ServerHost<Value> {
 	struct Outgoing {
 		std::string to;
@@ -99,16 +112,6 @@ struct ServerApp : goldnet::ServerHost<Value> {
 	// --- goldnet's host interface (ServerHost): everything is visible to everyone, and the one
 	// command stream is a byte string, so the defaults cover the rest ---
 
-	EntityLayout prepare(GServer::Entity &e) override {
-		EntityLayout l;
-		if (players.count(e.net_id())) {
-			l.slots = PLAYER_SLOTS;
-			l.priority = 4.0f; // players before blocks when a packet overflows
-		} else {
-			l.slots = BLOCK_SLOTS;
-		}
-		return l;
-	}
 	void read(GServer::Entity &e, bool) override {
 		auto pit = players.find(e.net_id());
 		if (pit != players.end()) {
@@ -214,7 +217,7 @@ struct ServerApp : goldnet::ServerHost<Value> {
 		GServer::SpawnRecord rec;
 		rec.data = { KIND_PLAYER, p.color, (uint8_t)(peer == 0) };
 		server.add_spawn(id, rec);
-		server.add_entity(id, id);
+		server.add_entity(id, id, player_layout());
 		return id;
 	}
 
@@ -274,7 +277,7 @@ struct ServerApp : goldnet::ServerHost<Value> {
 		rec.data = { KIND_BLOCK, owner.color, 0, 0, 0, 0, (uint8_t)throw_tick, (uint8_t)(throw_tick >> 8) };
 		put_u32_le(&rec.data[2], owner.net_id);
 		server.add_spawn(id, rec);
-		server.add_entity(id, id);
+		server.add_entity(id, id, block_layout());
 	}
 
 	void hook_block(SBlock &b) {
@@ -322,7 +325,7 @@ struct ServerApp : goldnet::ServerHost<Value> {
 			b.body = make_block_body();
 			b.body->set_position(spot);
 			hook_block(b);
-			server.add_entity(id, id); // no spawn: the client has these from the start
+			server.add_entity(id, id, block_layout()); // no spawn: the client has these from the start
 			id++;
 		}
 	}

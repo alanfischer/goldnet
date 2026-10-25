@@ -49,16 +49,6 @@ struct TestServerHost {
 	TestServer *server;
 
 	bool live(TestServer::Entity &e) { return world->ents.count(e.key()) > 0; }
-	EntityLayout prepare(TestServer::Entity &e) {
-		const WorldEnt &w = world->ents[e.key()];
-		EntityLayout l;
-		l.slots = (int)w.vals.size();
-		l.push = w.push;
-		l.priority = w.priority;
-		l.stepped.assign(l.slots, 1);
-		l.kinds_check = 7;
-		return l;
-	}
 	void read(TestServer::Entity &e, bool polled_only) {
 		world->reads++;
 		const WorldEnt &w = world->ents[e.key()];
@@ -89,11 +79,6 @@ struct MinimalServerHost : ServerHost<Val> {
 	std::vector<std::vector<uint8_t>> sent;
 	std::vector<Command> commands;
 
-	EntityLayout prepare(Entity &) override {
-		EntityLayout l;
-		l.slots = (int)vals.size();
-		return l;
-	}
 	void read(Entity &e, bool) override {
 		for (int s = 0; s < e.slots(); s++) {
 			server->stamp(e, s, vals[s]);
@@ -108,14 +93,16 @@ struct MinimalServerHost : ServerHost<Val> {
 struct MinimalClientHost : ClientHost<Val> {
 	std::vector<Val> vals;
 
-	bool registered(uint32_t net_id) override { return net_id == 100; }
-	int begin_entity(uint32_t net_id, uint32_t, bool, uint8_t, bool &) override {
-		return net_id == 100 ? (int)vals.size() : -1;
-	}
-	Val decode(Reader &r, int, const Val *, uint32_t) override { return get_varint(&r); }
-	bool set_slot(int s, const Val &v) override {
-		vals[s] = v;
-		return true;
+	EntityResult entity(EntityUpdate<Val> &u) override {
+		if (u.net_id() != 100) {
+			return ENTITY_SKIP;
+		}
+		for (int s : u.changed()) {
+			const Val v = get_varint(&u.reader());
+			u.set(s, v);
+			vals[s] = v;
+		}
+		return ENTITY_APPLIED;
 	}
 };
 
@@ -138,7 +125,6 @@ struct Peer {
 	int refuse_spawns = 0; // the host can't create the next N spawns yet
 	uint8_t kinds_check = 7; // how this host reads slots; the server's host says 7
 	std::map<uint32_t, std::pair<uint32_t, int>> creates; // spawn net_id -> the entity it registers
-	uint32_t cur = 0;
 };
 
 struct TestClientHost {
@@ -167,33 +153,31 @@ struct TestClientHost {
 		p->events.push_back("d" + std::to_string(net_id));
 	}
 	void relevance_lost(uint32_t net_id) { p->lost.push_back(net_id); }
-	bool registered(uint32_t net_id) { return p->slot_count.count(net_id) > 0; }
-	int begin_entity(uint32_t net_id, uint32_t mask, bool whole, uint8_t kinds_check, bool &r_defer) {
-		p->cur = net_id;
-		if (!p->slot_count.count(net_id)) {
-			return -1;
+	// Each slot an int, as its step from the baseline value (TestServerHost::encode).
+	EntityResult entity(EntityUpdate<Val> &u) {
+		const uint32_t id = u.net_id();
+		if (!p->slot_count.count(id) || (u.whole() && u.kinds_check() != p->kinds_check)) {
+			return ENTITY_SKIP;
 		}
-		if (whole && kinds_check != p->kinds_check) {
-			return -1;
+		if (p->not_ready.count(id)) {
+			return ENTITY_NOT_READY;
 		}
-		if (p->not_ready.count(net_id)) {
-			r_defer = mask != 0;
-			return -1;
+		std::vector<Val> &vals = p->vals[id];
+		vals.resize(p->slot_count[id]);
+		bool applied = false;
+		for (int s : u.changed()) {
+			const Val v = (u.base(s) ? *u.base(s) : 0) + get_varint(&u.reader());
+			u.set(s, v);
+			if ((size_t)s < vals.size()) {
+				vals[s] = v;
+				applied = true;
+			}
 		}
-		std::vector<Val> &v = p->vals[net_id];
-		v.resize(p->slot_count[net_id]);
-		return p->slot_count[net_id];
-	}
-	bool set_slot(int s, const Val &v) {
-		p->vals[p->cur][s] = v;
-		return true;
-	}
-	void end_entity(bool applied) {
 		if (applied) {
-			p->synced[p->cur]++;
+			p->synced[id]++;
 		}
+		return ENTITY_APPLIED;
 	}
-	Val decode(Reader &r, int, const Val *base, uint32_t) { return (base ? *base : 0) + get_varint(&r); }
 };
 
 struct TestUplinkHost {
@@ -226,9 +210,17 @@ struct Net {
 		return p;
 	}
 
+	// Its push declaration and priority are the world entity's, so set those first.
 	void add_entity(uint64_t key, uint32_t net_id, std::vector<Val> vals) {
-		world.ents[key].vals = vals;
-		server.add_entity(key, net_id);
+		WorldEnt &w = world.ents[key];
+		w.vals = vals;
+		EntityLayout l;
+		l.slots = (int)vals.size();
+		l.push = w.push;
+		l.priority = w.priority;
+		l.stepped.assign(l.slots, 1);
+		l.kinds_check = 7;
+		server.add_entity(key, net_id, l);
 		for (auto &kv : peers) {
 			kv.second.slot_count[net_id] = (int)vals.size();
 		}
@@ -782,10 +774,10 @@ static void test_budget_overflow_drains_by_priority() {
 	Net n;
 	Peer &p = n.add_peer(2);
 	const int count = 400; // 7 bytes each, so a packet carries well under half of them
+	n.world.ents[10 + count - 1].priority = 50.0f;
 	for (int i = 0; i < count; i++) {
 		n.add_entity(10 + i, 100 + i, { 0 });
 	}
-	n.world.ents[10 + count - 1].priority = 50.0f;
 	for (int i = 0; i < 10; i++) {
 		n.tick(); // the first full baseline overflows too; let it drain
 	}
@@ -961,10 +953,57 @@ static void test_removed_entity_leaves_client_frame() {
 	n.server.remove_entity(10);
 	n.world.ents.erase(10);
 	p.slot_count.erase(100);
+	p.client.forget(100);
 	n.add_entity(11, 101, { 2 });
 	n.tick();
 	CHECK(p.vals[101][0] == 2);
 	printf("  removed entity is pruned and the stream continues: ok\n");
+}
+
+// An entity the host does away with and makes again at the same id, while the server goes on
+// replicating it: once forgotten, its next delta has no base to apply to, so the client holds the ack
+// and the delta isn't applied to the new one, which never had the slot it doesn't carry.
+static void test_forgotten_entity_takes_no_delta() {
+	Net n;
+	Peer &p = n.add_peer(2);
+	n.add_entity(10, 100, { 1, 2 });
+	n.tick();
+	p.client.forget(100);
+	p.vals[100] = { 0, 0 }; // the host's new one
+	n.world.ents[10].vals[0] = 5;
+	n.tick();
+	CHECK(p.statuses.back() == STATUS_HELD);
+	CHECK((p.vals[100] == std::vector<Val>{ 0, 0 }));
+	printf("  a forgotten entity takes no delta: ok\n");
+}
+
+// A despawn drops the spawn's entity from the client's frames with no word from the host, so an id
+// spawned again takes its first delta only after it arrives whole.
+static void test_despawn_drops_the_entity() {
+	Net n;
+	Peer &a = n.add_peer(2);
+	n.add_entity(500, 500, { 1, 2 });
+	a.slot_count.erase(500);
+	a.creates[500] = { 500, 2 };
+	n.server.add_spawn(500, TestServer::SpawnRecord());
+	n.tick();
+	CHECK(a.spawned == std::vector<uint32_t>{ 500 });
+	CHECK((a.vals[500] == std::vector<Val>{ 1, 2 }));
+	n.server.remove_entity(500);
+	n.server.despawn(500);
+	n.world.ents.erase(500);
+	for (int i = 0; i < 4; i++) {
+		n.tick();
+	}
+	CHECK(a.despawned == std::vector<uint32_t>{ 500 });
+	n.add_entity(500, 500, { 7, 8 });
+	n.server.add_spawn(500, TestServer::SpawnRecord());
+	a.vals.erase(500);
+	for (int i = 0; i < 4; i++) {
+		n.tick();
+	}
+	CHECK((a.vals[500] == std::vector<Val>{ 7, 8 }));
+	printf("  a despawn drops the entity from the client's frames: ok\n");
 }
 
 // GoldSrc rate / choke: a rated peer's snapshot bytes stay within its rate, it still converges, and
@@ -1271,7 +1310,9 @@ static void test_default_hosts() {
 	sh.server = &server;
 	sh.vals = { 4, 5 };
 	server.add_peer(2);
-	server.add_entity(10, 100);
+	EntityLayout layout;
+	layout.slots = 2;
+	server.add_entity(10, 100, layout);
 	const Schema schema{ FIELD_INT, FIELD_BOOL };
 	server.set_command_schema(9, schema);
 	Client<Val> client;
@@ -1339,6 +1380,8 @@ int main() {
 	test_aged_history_goes_whole();
 	test_kinds_mismatch_refuses_entity();
 	test_removed_entity_leaves_client_frame();
+	test_forgotten_entity_takes_no_delta();
+	test_despawn_drops_the_entity();
 	test_rate_chokes_to_the_budget();
 	test_charged_traffic_delays_the_next_snapshot();
 	test_arrival_stats_count_only_real_loss();

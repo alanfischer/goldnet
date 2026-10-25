@@ -240,26 +240,22 @@ struct ClientCore : goldnet::ClientHost<Value> {
 		}
 		ents.erase(it);
 	}
-	bool registered(uint32_t net_id) override { return ents.count(net_id) > 0; }
-	uint32_t cur_id = 0;
-	int begin_entity(uint32_t net_id, uint32_t, bool, uint8_t, bool &) override {
-		auto it = ents.find(net_id);
+	EntityResult entity(EntityUpdate<Value> &u) override {
+		auto it = ents.find(u.net_id());
 		if (it == ents.end()) {
-			return -1;
+			return ENTITY_SKIP;
 		}
-		cur_id = net_id;
-		return (int)it->second.vals.size();
-	}
-	bool set_slot(int slot, const Value &v) override {
-		ents[cur_id].vals[slot] = v;
-		return true;
-	}
-	void end_entity(bool applied) override {
-		if (applied) {
-			ents[cur_id].has_state = true;
+		Ent &e = it->second;
+		for (int s : u.changed()) {
+			const Value v = decode_value(u.reader());
+			u.set(s, v);
+			if ((size_t)s < e.vals.size()) {
+				e.vals[s] = v;
+				e.has_state = true;
+			}
 		}
+		return ENTITY_APPLIED;
 	}
-	Value decode(Reader &r, int, const Value *, uint32_t) override { return decode_value(r); }
 
 	// --- the session ---
 

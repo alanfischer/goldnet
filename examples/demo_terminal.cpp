@@ -170,11 +170,6 @@ struct ServerApp : ServerHost<Value> {
 	// The host interface Server::tick() and Server::receive_uplink() call back into (ServerHost).
 	// Everything is visible to everyone, and the one command stream is a byte string, so the
 	// defaults cover the rest.
-	EntityLayout prepare(DemoServer::Entity &e) override {
-		EntityLayout l;
-		l.slots = e.key() == SCOREBOARD_ID ? 2 : BALL_SLOTS; // the scoreboard: live balls, total bounces
-		return l;
-	}
 	void read(DemoServer::Entity &e, bool) override {
 		if (e.key() == SCOREBOARD_ID) {
 			server.stamp(e, 0, Value((int64_t)balls.size()));
@@ -241,7 +236,9 @@ struct ServerApp : ServerHost<Value> {
 		rec.node_key = id;
 		rec.data = { (uint8_t)b.letter };
 		server.add_spawn(id, rec);
-		server.add_entity(id, id);
+		EntityLayout l;
+		l.slots = BALL_SLOTS;
+		server.add_entity(id, id, l);
 	}
 
 	void despawn_oldest() {
@@ -308,7 +305,9 @@ struct ServerApp : ServerHost<Value> {
 	int run(uint16_t port) {
 		fd = open_socket(port);
 		server.set_packet_overhead(28); // IPv4 + UDP headers
-		server.add_entity(SCOREBOARD_ID, SCOREBOARD_ID);
+		EntityLayout scoreboard;
+		scoreboard.slots = 2; // live balls, total bounces
+		server.add_entity(SCOREBOARD_ID, SCOREBOARD_ID, scoreboard);
 		printf("[server] listening on udp %d (loss %d%%, latency %d ms)\n", port, sim.loss_percent(),
 				sim.latency_max_ms());
 
@@ -377,7 +376,6 @@ struct ClientApp : ClientHost<Value> {
 		std::vector<Value> vals;
 	};
 	std::map<uint32_t, Ent> ents;
-	uint32_t cur = 0;
 	uint32_t server_ms = 0;
 	int spawns = 0, despawns = 0, snapshots = 0, committed = 0;
 	size_t bytes_in = 0;
@@ -394,17 +392,21 @@ struct ClientApp : ClientHost<Value> {
 		ents.erase(net_id);
 		despawns++;
 	}
-	bool registered(uint32_t net_id) override { return ents.count(net_id) > 0; }
-	int begin_entity(uint32_t net_id, uint32_t, bool, uint8_t, bool &) override {
-		cur = net_id;
-		auto it = ents.find(net_id);
-		return it == ents.end() ? -1 : (int)it->second.vals.size();
+	EntityResult entity(EntityUpdate<Value> &u) override {
+		auto it = ents.find(u.net_id());
+		if (it == ents.end()) {
+			return ENTITY_SKIP;
+		}
+		std::vector<Value> &vals = it->second.vals;
+		for (int s : u.changed()) {
+			const Value v = decode_value(u.reader(), u.server_time());
+			u.set(s, v);
+			if ((size_t)s < vals.size()) {
+				vals[s] = v;
+			}
+		}
+		return ENTITY_APPLIED;
 	}
-	bool set_slot(int slot, const Value &v) override {
-		ents[cur].vals[slot] = v;
-		return true;
-	}
-	Value decode(Reader &r, int, const Value *, uint32_t ref_time_ms) override { return decode_value(r, ref_time_ms); }
 
 	void transmit(const std::vector<uint8_t> &pkt) {
 		sendto(fd, pkt.data(), pkt.size(), 0, (sockaddr *)&server_addr, sizeof(server_addr));

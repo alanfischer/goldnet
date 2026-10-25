@@ -82,7 +82,7 @@ goldnet::Server<MyValue> server;
 server.set_packet_overhead(28);     // IPv4 + UDP, for rate budgets
 server.set_snapshot_rate(60);       // how often you call tick()
 
-server.add_entity(key, net_id);     // starts replicating; remove_entity(key)
+server.add_entity(key, net_id, layout);  // starts replicating (EntityLayout: its slots); remove_entity(key)
 server.add_spawn(net_id, record);   // a runtime entity clients must create; despawn(net_id)
 server.mark_dirty(key);             // a pushed slot was written (EntityLayout::push)
 
@@ -99,8 +99,7 @@ The server's host, one object for `tick()` and `receive_uplink()`:
 
 ```cpp
 struct MyServerHost : goldnet::ServerHost<MyValue> {
-    goldnet::EntityLayout prepare(Entity &e) override;  // first tick: how many slots, and how they go
-    void read(Entity &e, bool polled_only) override;    // server.stamp(e, slot, value) for each slot
+    void read(Entity &e, bool polled_only) override;  // server.stamp(e, slot, value) for each slot
     void encode(goldnet::Writer &w, const Entity &e, int slot, const MyValue *base, uint32_t now) override;
     void send(int32_t peer, const goldnet::Writer &packet) override;
     // As you need them: live, visible, spawn_visible, command, message, command_schema, protocol_mismatch
@@ -112,6 +111,7 @@ Client:
 ```cpp
 goldnet::Client<MyValue> client;
 client.apply(bytes, size, host, now_ms);  // each snapshot; .status says why one wasn't taken
+client.forget(net_id);  // an entity the host did away with, other than by its despawn
 // client.reset() for a new session
 
 client.push_command(stream_id, bytes, size, now_ms);  // one command; returns its seq
@@ -127,11 +127,17 @@ The client's host:
 
 ```cpp
 struct MyClientHost : goldnet::ClientHost<MyValue> {
-    bool registered(uint32_t net_id) override;  // is there an entity with this id here?
-    int begin_entity(uint32_t net_id, uint32_t mask, bool whole, uint8_t kinds_check, bool &r_defer) override;
-    MyValue decode(goldnet::Reader &r, int slot, const MyValue *base, uint32_t ref_time_ms) override;
-    bool set_slot(int slot, const MyValue &v) override;
-    // As you need them: end_entity, spawn, despawn, relevance_lost, server_time, message, protocol_mismatch
+    goldnet::EntityResult entity(goldnet::EntityUpdate<MyValue> &u) override {
+        Thing *t = find(u.net_id());
+        if (!t) return goldnet::ENTITY_SKIP;       // not one we have: its bytes are stepped over
+        for (int s : u.changed()) {                // each changed slot, in order
+            MyValue v = decode(u.reader(), s, u.base(s));  // as your encode wrote it
+            u.set(s, v);                           // the next delta's base
+            t->apply(s, v);
+        }
+        return goldnet::ENTITY_APPLIED;
+    }
+    // As you need them: spawn, despawn, relevance_lost, server_time, message, protocol_mismatch
 };
 ```
 
