@@ -216,15 +216,13 @@ struct ServerApp : goldnet::ServerHost<Value> {
 
 		GServer::SpawnRecord rec;
 		rec.data = { KIND_PLAYER, p.color, (uint8_t)(peer == 0) };
-		server.add_spawn(id, rec);
-		server.add_entity(id, player_layout());
+		server.add_entity(id, player_layout(), rec);
 		return id;
 	}
 
 	void remove_player(uint32_t id) {
 		sim.remove_solid(players[id].body);
 		players.erase(id);
-		server.remove_entity(id);
 		server.despawn(id);
 	}
 
@@ -276,8 +274,7 @@ struct ServerApp : goldnet::ServerHost<Value> {
 		GServer::SpawnRecord rec;
 		rec.data = { KIND_BLOCK, owner.color, 0, 0, 0, 0, (uint8_t)throw_tick, (uint8_t)(throw_tick >> 8) };
 		put_u32_le(&rec.data[2], owner.net_id);
-		server.add_spawn(id, rec);
-		server.add_entity(id, block_layout());
+		server.add_entity(id, block_layout(), rec);
 	}
 
 	void hook_block(SBlock &b) {
@@ -441,7 +438,6 @@ struct ServerApp : goldnet::ServerHost<Value> {
 		for (uint32_t id : gone) {
 			sim.remove_solid(blocks[id].body);
 			blocks.erase(id);
-			server.remove_entity(id);
 			server.despawn(id);
 		}
 

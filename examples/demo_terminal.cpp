@@ -235,17 +235,15 @@ struct ServerApp : ServerHost<Value> {
 
 		DemoServer::SpawnRecord rec;
 		rec.data = { (uint8_t)b.letter };
-		server.add_spawn(id, rec);
 		EntityLayout l;
 		l.slots = BALL_SLOTS;
-		server.add_entity(id, l);
+		server.add_entity(id, l, rec);
 	}
 
 	void despawn_oldest() {
 		const uint32_t id = spawn_order.front();
 		spawn_order.erase(spawn_order.begin());
 		balls.erase(id);
-		server.remove_entity(id);
 		server.despawn(id);
 	}
 
