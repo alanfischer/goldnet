@@ -11,7 +11,8 @@
 // carried on the entity so reaching it costs no second lookup.
 //
 // Peers. add_peer() starts serving one and remove_peer() stops; tick() sends to the peers added, and
-// receive_uplink() and the netchan take only theirs. A packet from any other peer is dropped.
+// receive_uplink() and the netchan take only theirs. A packet from any other peer is dropped. Add
+// and remove peers between ticks, never from inside the host's callbacks.
 //
 // The host passed to tick() provides:
 //   bool live(Entity &e)                        is the entity replicating this tick? (may refresh e.user)
@@ -123,6 +124,9 @@ public:
 	private:
 		friend class Server;
 
+		// The layout codes slot s against the peer's baseline value.
+		bool stepped(int p_slot) const { return (size_t)p_slot < layout_.stepped.size() && layout_.stepped[p_slot]; }
+
 		uint64_t key_ = 0;
 		uint32_t net_id_ = 0;
 		EntityLayout layout_;
@@ -166,19 +170,17 @@ public:
 
 	Entity &add_entity(uint64_t p_key, uint32_t p_net_id) {
 		auto it = index_.find(p_key);
+		Entity *e;
 		if (it != index_.end()) {
-			Entity &e = ents_[it->second];
-			e = Entity();
-			e.key_ = p_key;
-			e.net_id_ = p_net_id;
-			return e;
+			e = &ents_[it->second];
+			*e = Entity();
+		} else {
+			index_[p_key] = ents_.size();
+			e = &ents_.emplace_back();
 		}
-		index_[p_key] = ents_.size();
-		ents_.emplace_back();
-		Entity &e = ents_.back();
-		e.key_ = p_key;
-		e.net_id_ = p_net_id;
-		return e;
+		e->key_ = p_key;
+		e->net_id_ = p_net_id;
+		return *e;
 	}
 
 	// Order-preserving, so the packet order of everything else is unaffected.
@@ -220,7 +222,7 @@ public:
 		if (p_value != p_e.vals_[p_slot]) {
 			p_e.vals_[p_slot] = p_value;
 			p_e.slot_ctr_[p_slot] = ctr_;
-			if (stepped(p_e, p_slot)) {
+			if (p_e.stepped(p_slot)) {
 				typename Entity::History &h = p_e.history_[p_slot];
 				if (h.ring.size() < (size_t)SLOT_HISTORY) {
 					h.ring.emplace_back(ctr_, p_value);
@@ -268,7 +270,7 @@ public:
 	// Start serving p_peer: tick() sends it snapshots from the next tick on, and its uplink packets and
 	// messages are taken. A no-op for a peer already added.
 	void add_peer(int32_t p_peer) {
-		if (rings_.emplace(p_peer, PeerRing()).second) {
+		if (rings_.try_emplace(p_peer).second) {
 			peers_.push_back(p_peer);
 		}
 	}
@@ -397,10 +399,6 @@ public:
 	void tick(uint32_t p_now, Host &p_host);
 
 private:
-	static bool stepped(const Entity &p_e, int p_slot) {
-		return (size_t)p_slot < p_e.layout_.stepped.size() && p_e.layout_.stepped[p_slot];
-	}
-
 	// A stepped slot's value as of counter p_ctr, or null if that has left its history.
 	static const V *value_at(const Entity &p_e, int p_slot, uint32_t p_ctr) {
 		const typename Entity::History &h = p_e.history_[p_slot];
@@ -695,11 +693,7 @@ void Server<V, X>::tick(uint32_t p_now, Host &p_host) {
 	std::vector<Candidate> candidates;
 	Writer vals; // one entity's slot bytes, reused so its capacity outlives the entity
 	for (int32_t peer : due) {
-		auto rit = rings_.find(peer);
-		if (rit == rings_.end()) {
-			continue; // removed by the host during this tick (in send, say)
-		}
-		PeerRing &pr = rit->second;
+		PeerRing &pr = rings_[peer];
 		pr.last_sent_ms = p_now;
 
 		// Baseline = the frame this peer last acked, if we still hold it. Otherwise send a full
@@ -828,11 +822,10 @@ void Server<V, X>::tick(uint32_t p_now, Host &p_host) {
 				// Every slot that changed since the baseline goes, even one back at the baseline's value:
 				// the client may have applied a newer frame since. One whose baseline value has left
 				// its history sends the entity whole.
-				const int n_slots = std::min(n_vals, (int)e.slot_ctr_.size());
-				for (int s = 0; s < n_slots; s++) {
+				for (int s = 0; s < n_vals; s++) {
 					if (e.slot_ctr_[s] > base_ctr) {
 						mask |= (1u << s);
-						whole = whole || (stepped(e, s) && !value_at(e, s, base_ctr));
+						whole = whole || (e.stepped(s) && !value_at(e, s, base_ctr));
 					}
 				}
 			}
@@ -924,7 +917,7 @@ void Server<V, X>::tick(uint32_t p_now, Host &p_host) {
 			vals.clear();
 			for (size_t s = 0; s < e.vals_.size(); s++) {
 				if (c.mask & (1u << s)) {
-					const bool from_base = !c.whole && stepped(e, (int)s);
+					const bool from_base = !c.whole && e.stepped((int)s);
 					p_host.encode(vals, e, (int)s, from_base ? value_at(e, (int)s, base_ctr) : nullptr, p_now);
 				}
 			}

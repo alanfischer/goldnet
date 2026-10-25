@@ -34,7 +34,6 @@ struct World {
 	std::map<uint64_t, WorldEnt> ents;
 	std::map<int32_t, std::vector<std::vector<uint8_t>>> outbox; // peer -> packets sent this tick
 	int reads = 0;
-	int32_t remove_in_send = 0; // a peer the host removes from inside the next send()
 
 	bool is_visible(uint64_t key, int32_t peer) const {
 		auto it = ents.find(key);
@@ -78,10 +77,6 @@ struct TestServerHost {
 	}
 	void send(int32_t peer, const Writer &w) {
 		world->outbox[peer].emplace_back(w.data(), w.data() + w.size());
-		if (world->remove_in_send) {
-			server->remove_peer(world->remove_in_send);
-			world->remove_in_send = 0;
-		}
 	}
 };
 
@@ -1219,20 +1214,6 @@ static void test_only_added_peers_are_served() {
 	printf("  only the peers added are served, and a removed one stays removed: ok\n");
 }
 
-// A host may remove a peer from inside tick() (a send that finds it gone, say). The rest of the tick
-// skips it rather than bring it back.
-static void test_peer_removed_during_tick() {
-	Net n;
-	n.add_peer(2);
-	n.add_peer(3);
-	n.add_entity(10, 100, { 1 });
-	n.world.remove_in_send = 3;
-	n.tick();
-	CHECK(n.sent_to(2) == 1 && n.sent_to(3) == 0);
-	CHECK(!n.server.has_peer(3) && (n.server.peers() == std::vector<int32_t>{ 2 }));
-	printf("  a peer removed during tick is skipped, not brought back: ok\n");
-}
-
 int main() {
 	printf("protocol:\n");
 	test_baseline_then_delta();
@@ -1277,7 +1258,6 @@ int main() {
 	test_messages_ride_the_snapshot_in_order();
 	test_messages_survive_a_lost_snapshot();
 	test_only_added_peers_are_served();
-	test_peer_removed_during_tick();
 	printf("%d checks passed\n", checks);
 	return 0;
 }
