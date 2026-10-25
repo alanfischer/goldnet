@@ -29,7 +29,7 @@ public:
 	static constexpr uint32_t PAUSE_MS = 500;
 
 	// Something sent at p_sent_ms (on the sender's clock) arrived at p_now. Returns the current lag.
-	uint32_t note(uint32_t p_now, int64_t p_sent_ms) {
+	uint32_t note(int64_t p_sent_ms, uint32_t p_now) {
 		if (!any_ || p_now - last_arrival_ > PAUSE_MS) {
 			cur_min_ = INF;
 			prev_min_ = INF;
@@ -121,7 +121,7 @@ public:
 
 	// One report of the downlink lag, with what is arriving (bytes/sec on the wire) and the share of
 	// snapshots lost over the last sample. Returns the rate in bytes/sec; 0 = no limit.
-	int note(uint32_t p_now, double p_lag_ms, double p_delivered_bps, double p_loss) {
+	int note(double p_lag_ms, double p_delivered_bps, double p_loss, uint32_t p_now) {
 		smoothed_ += (p_lag_ms - smoothed_) * SMOOTHING;
 		if (!started_) {
 			started_ = true;
@@ -187,7 +187,7 @@ public:
 
 	// One report of the uplink lag and of our packets arriving per second (0 = not known yet);
 	// p_max_rate is the ceiling (the rate commands are made). Returns the rate in packets/sec.
-	double note(uint32_t p_now, double p_lag_ms, double p_arriving, double p_max_rate) {
+	double note(double p_lag_ms, double p_arriving, double p_max_rate, uint32_t p_now) {
 		rate_ = std::min(rate_, p_max_rate);
 		smoothed_ += (p_lag_ms - smoothed_) * SMOOTHING;
 		if (!calm_set_) {
@@ -237,7 +237,7 @@ public:
 
 	// Running totals of what arrived (bytes on the wire, snapshots received and lost), read once a
 	// SAMPLE_MS. Totals that went down belong to a new session.
-	void sample(uint32_t p_now, uint64_t p_bytes, uint64_t p_received, uint64_t p_lost) {
+	void sample(uint64_t p_bytes, uint64_t p_received, uint64_t p_lost, uint32_t p_now) {
 		if (sampled_ && p_bytes >= bytes_ && p_now != sample_ms_) {
 			delivered_bps_ = (double)(p_bytes - bytes_) * 1000.0 / (double)(p_now - sample_ms_);
 		}
@@ -258,9 +258,9 @@ public:
 	bool sample_due(uint32_t p_now) const { return !sampled_ || p_now - sample_ms_ >= SAMPLE_MS; }
 
 	// One snapshot arrived, stamped with the server's send time. Returns the rate to ask for.
-	int note(uint32_t p_now, uint32_t p_server_time_ms) {
-		lag_ = queue_.note(p_now, (int64_t)p_server_time_ms);
-		return rate_auto_.note(p_now, (double)lag_, delivered_bps_, loss_);
+	int note(uint32_t p_server_time_ms, uint32_t p_now) {
+		lag_ = queue_.note((int64_t)p_server_time_ms, p_now);
+		return rate_auto_.note((double)lag_, delivered_bps_, loss_, p_now);
 	}
 
 	uint32_t lag_ms() const { return lag_; }

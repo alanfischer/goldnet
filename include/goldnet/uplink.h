@@ -313,7 +313,7 @@ public:
 
 	// Build the next uplink packet, carrying p_snapshot_ack, what this end has received of the server's
 	// channel (Client::channel_ack), and whatever is due.
-	void write(uint32_t p_now, uint16_t p_snapshot_ack, const ChannelAckSource &p_received, Writer &r_out) {
+	void write(Writer &r_out, uint16_t p_snapshot_ack, const ChannelAckSource &p_received, uint32_t p_now) {
 		const uint16_t seq = seq_;
 		seq_ = command_seq_next(seq_);
 		const ChannelAck ack = p_received.at(p_now);
@@ -632,7 +632,7 @@ Result CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_
 		p.stamp_last = send_time;
 		p.stamp_ms = sent_ms;
 	}
-	p.lag_ms = p.queue.note(p_now, sent_ms);
+	p.lag_ms = p.queue.note(sent_ms, p_now);
 	p.arrivals.note(p_now);
 	p.rate = rate > 0xFFFFFFFFu / 100 ? 0xFFFFFFFFu : rate * 100;
 	p.update_rate = update_rate;

@@ -231,7 +231,7 @@ struct Net {
 		now += dt;
 		world.outbox.clear();
 		TestServerHost sh{ &world, &server };
-		server.tick(now, sh);
+		server.tick(sh, now);
 		for (auto &kv : world.outbox) {
 			Peer &p = peers[kv.first];
 			for (auto &pkt : kv.second) {
@@ -246,7 +246,7 @@ struct Net {
 				}
 				if (auto_uplink && p.client.uplink_due(now)) {
 					Writer w;
-					p.client.write_uplink(now, w);
+					p.client.write_uplink(w, now);
 					if (!drop_acks.count(p.id)) {
 						server.receive_uplink(p.id, w.data(), w.size(), uplink_host, now);
 					}
@@ -258,7 +258,7 @@ struct Net {
 	// The client's next uplink packet, now, delivered whatever drop_acks says.
 	Result send_uplink(Peer &p) {
 		Writer w;
-		p.client.write_uplink(now, w);
+		p.client.write_uplink(w, now);
 		return server.receive_uplink(p.id, w.data(), w.size(), uplink_host, now);
 	}
 
@@ -324,6 +324,42 @@ static void test_idle_sends_nothing_until_keepalive() {
 	}
 	CHECK(sent == 1); // one keepalive for the clock feed, every CLOCK_KEEPALIVE_MS
 	printf("  idle: nothing but the clock keepalive: ok\n");
+}
+
+// A clock that starts at 0 is a clock like any other: the first snapshot goes, and the keepalive and
+// a slower peer's cadence count from it.
+static void test_clock_may_start_at_zero() {
+	Net n;
+	n.server.set_snapshot_rate(60);
+	Peer &p = n.add_peer(2);
+	n.add_entity(10, 100, { 1 });
+	n.now = 0;
+	n.tick(0);
+	CHECK(n.sent_to(2) == 1 && p.vals[100][0] == 1);
+	n.tick();
+	CHECK(n.sent_to(2) == 0); // idle, and the keepalive counts from the snapshot at 0
+	int sent = 0;
+	for (int i = 0; i < 14; i++) { // to 240 ms
+		n.tick();
+		sent += (int)n.sent_to(2);
+	}
+	CHECK(sent == 0);
+
+	Net m;
+	m.server.set_snapshot_rate(60);
+	Peer &q = m.add_peer(2);
+	q.client.set_update_rate(20);
+	m.add_entity(10, 100, { 0 });
+	CHECK(m.send_uplink(q)); // the update rate it asks for
+	m.now = 0;
+	sent = 0;
+	for (int i = 0; i < 12; i++) { // 0 to 176 ms, a change every tick
+		m.world.ents[10].vals[0] = i + 1;
+		m.tick(i == 0 ? 0 : 16);
+		sent += (int)m.sent_to(2);
+	}
+	CHECK(sent == 4); // every third tick, from the first
+	printf("  a clock may start at 0: ok\n");
 }
 
 static void test_lost_snapshot_self_heals() {
@@ -419,7 +455,7 @@ static void test_truncated_packet_not_committed() {
 	std::vector<uint8_t> pkt = n.last_packet(2);
 	TestClientHost ch{ &p };
 	Client<Val>::ApplyInfo info = p.client.apply(pkt.data(), pkt.size() - 1, ch, n.now);
-	CHECK(!info.committed);
+	CHECK(!info);
 	CHECK(info.ack == 0);
 	CHECK(info.status == STATUS_MALFORMED);
 	printf("  truncated packet is not committed or acked: ok\n");
@@ -1049,8 +1085,8 @@ static void test_charged_traffic_delays_the_next_snapshot() {
 	p.client.set_rate(10000); // fast enough that its update rate isn't what holds it back
 	n.send_uplink(p);
 	n.tick();                          // the first snapshot goes out
-	n.server.charge(2, n.now, 2500);   // then the host sends two RPC bursts, 5000 bytes in all:
-	n.server.charge(2, n.now, 2500);   // half a second's worth, so they queue behind each other
+	n.server.charge(2, 2500, n.now);   // then the host sends two RPC bursts, 5000 bytes in all:
+	n.server.charge(2, 2500, n.now);   // half a second's worth, so they queue behind each other
 	int sent = 0;
 	for (int t = 0; t < 25; t++) {     // 400 ms
 		n.world.ents[10].vals[0] = t + 1;
@@ -1320,7 +1356,7 @@ static void test_default_hosts() {
 	MinimalClientHost ch;
 	ch.vals.resize(2);
 
-	server.tick(1000, sh);
+	server.tick(sh, 1000);
 	CHECK(sh.sent.size() == 1);
 	CHECK(client.apply(sh.sent.back().data(), sh.sent.back().size(), ch, 1000).status == STATUS_OK);
 	CHECK((ch.vals == std::vector<Val>{ 4, 5 }));
@@ -1332,13 +1368,13 @@ static void test_default_hosts() {
 	const uint8_t bytes[2] = { 7, 8 };
 	client.push_command(4, bytes, sizeof(bytes), 1000);
 	Writer w;
-	client.write_uplink(1000, w);
+	client.write_uplink(w, 1000);
 	CHECK(server.receive_uplink(2, w.data(), w.size(), sh, 1000));
 	CHECK(sh.commands.size() == 2 && sh.commands[0][0].i == -3 && sh.commands[0][1].i == 1);
 	CHECK(sh.commands.size() == 2 && sh.commands[1][0].bytes == std::vector<uint8_t>(bytes, bytes + 2));
 
 	sh.vals[1] = 6;
-	server.tick(1016, sh);
+	server.tick(sh, 1016);
 	CHECK(sh.sent.size() == 2 && base_seq_of(sh.sent.back()) != 0); // a delta against the acked frame
 	CHECK(client.apply(sh.sent.back().data(), sh.sent.back().size(), ch, 1016).status == STATUS_OK);
 	CHECK((ch.vals == std::vector<Val>{ 4, 6 }));
@@ -1349,6 +1385,7 @@ int main() {
 	printf("protocol:\n");
 	test_baseline_then_delta();
 	test_idle_sends_nothing_until_keepalive();
+	test_clock_may_start_at_zero();
 	test_lost_snapshot_self_heals();
 	test_lost_ack_resends_against_old_baseline();
 	test_aged_out_ack_falls_back_to_full_frame();

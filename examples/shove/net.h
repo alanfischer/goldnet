@@ -12,6 +12,8 @@
 #include "goldnet/codec.h"
 #include "goldnet/protocol.h"
 
+#include "../value_tags.h"
+
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>

@@ -8,7 +8,7 @@
 // (push_command and queue_reliable / queue_unreliable, see uplink.h), the snapshot ack, what it has of the server's channel, and the rate and
 // update rate it asks for (set_rate, set_update_rate). Send one whenever uplink_due() says so:
 //
-//   if (client.uplink_due(now)) { Writer w; client.write_uplink(now, w); /* send w */ }
+//   if (client.uplink_due(now)) { Writer w; client.write_uplink(w, now); /* send w */ }
 //
 // A fresh ack makes a packet due on its own, unless commands are flowing: then it rides the next
 // command packet, which comes within the command interval (set_command_rate).
@@ -146,16 +146,14 @@ private:
 template <class V>
 class Client {
 public:
-	// What apply() made of a snapshot: why it wasn't taken, if it wasn't, and what it saw, for a
-	// host's debug print.
-	struct ApplyInfo {
-		Status status = STATUS_OK;
+	// What apply() made of a snapshot: why it wasn't taken, if it wasn't (it tests true when it was:
+	// committed and acked), and what it saw, for a host's debug print.
+	struct ApplyInfo : Result {
 		uint16_t seq = 0;
 		uint16_t base_seq = 0;
 		int spawns = 0;
 		int despawns = 0;
 		int changed = 0;
-		bool committed = false;
 		uint16_t ack = 0;         // the snapshot ack it queued for the uplink; 0 = none
 		uint16_t command_ack = 0; // the header's: the newest command the server has; 0 = none
 	};
@@ -265,7 +263,12 @@ public:
 		return uplink_.push(p_stream, p_data, p_size, p_now);
 	}
 
-	void queue_reliable(const uint8_t *p_data, size_t p_size) { uplink_.queue_reliable(p_data, p_size); }
+	// Always true, as Server::queue_reliable is for a peer it serves: the reliable stream takes
+	// everything, and a server that stops taking it shows as Stats::overflowed.
+	bool queue_reliable(const uint8_t *p_data, size_t p_size) {
+		uplink_.queue_reliable(p_data, p_size);
+		return true;
+	}
 	// False if the datagram is full and the message was dropped.
 	bool queue_unreliable(const uint8_t *p_data, size_t p_size) { return uplink_.queue_unreliable(p_data, p_size); }
 
@@ -319,8 +322,8 @@ public:
 	}
 
 	// Build the next uplink packet.
-	void write_uplink(uint32_t p_now, Writer &r_out) {
-		uplink_.write(p_now, ack_, chan_.ack_source(), r_out);
+	void write_uplink(Writer &r_out, uint32_t p_now) {
+		uplink_.write(r_out, ack_, chan_.ack_source(), p_now);
 		news_ = false;
 	}
 
@@ -385,7 +388,7 @@ private:
 		const bool every = hz <= 0.0 || (auto_command_rate_ && hz >= command_rate_max_);
 		uplink_.set_interval_ms(every ? 0 : (uint32_t)std::lround(1000.0 / hz));
 	}
-	void note_header(uint32_t p_now, uint32_t p_server_time, uint32_t p_lag_ms, uint32_t p_pps, uint32_t p_granted);
+	void note_header(uint32_t p_server_time, uint32_t p_lag_ms, uint32_t p_pps, uint32_t p_granted, uint32_t p_now);
 };
 
 template <class V>
@@ -455,7 +458,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	// client can drive a clock estimator from. Emitted after the stale-seq drop (a reordered
 	// snapshot's time is <= one already fed) but before the baseline-resolution drop below, so a
 	// forward snapshot we can't reconstruct for state still contributes its valid clock sample.
-	note_header(p_now, server_time, uplink_lag_ms, uplink_pps, update_rate);
+	note_header(server_time, uplink_lag_ms, uplink_pps, update_rate, p_now);
 	uplink_.on_ack(command_ack);
 	info.command_ack = command_ack;
 	p_host.server_time(server_time); // after note_header, so the host reads this header's link news
@@ -623,24 +626,23 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	last_seq_ = seq;
 	has_ = true;
 	queue_ack(seq, info);
-	info.committed = true;
 	return info;
 }
 
 // An in-order header's link news: the downlink's lag and what arrived, the server's report of the
 // uplink, and the update rate it granted. The automatic picks follow from them.
 template <class V>
-void Client<V>::note_header(uint32_t p_now, uint32_t p_server_time, uint32_t p_lag_ms, uint32_t p_pps,
-		uint32_t p_granted) {
+void Client<V>::note_header(uint32_t p_server_time, uint32_t p_lag_ms, uint32_t p_pps, uint32_t p_granted,
+		uint32_t p_now) {
 	if (downlink_.sample_due(p_now)) {
-		downlink_.sample(p_now, received_bytes_, arrivals_.received, arrivals_.lost);
+		downlink_.sample(received_bytes_, arrivals_.received, arrivals_.lost, p_now);
 	}
-	downlink_.note(p_now, p_server_time);
+	downlink_.note(p_server_time, p_now);
 	uplink_lag_ms_ = p_lag_ms;
 	uplink_pps_ = p_pps;
 	update_rate_granted_ = (int)p_granted;
 	if (auto_command_rate_) {
-		cmd_auto_.note(p_now, (double)p_lag_ms, (double)p_pps, command_rate_max_);
+		cmd_auto_.note((double)p_lag_ms, (double)p_pps, command_rate_max_, p_now);
 	}
 	if (auto_rate_ || auto_command_rate_) {
 		apply_link();

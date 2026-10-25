@@ -136,16 +136,16 @@ static void test_pipe_keeps_order() {
 	Sim s;
 	std::vector<int> fired;
 	auto fire = [&](int &p) { fired.push_back(p); };
-	s.enqueue(1000, 0, 100, 1); // due 1100
-	s.enqueue(1000, 0, 10, 2);  // due 1010, but may not overtake 1
-	s.enqueue(1050, 0, 80, 3);  // due 1130
-	s.pump(1050, fire);
+	s.enqueue(0, 100, 1, 1000); // due 1100
+	s.enqueue(0, 10, 2, 1000);  // due 1010, but may not overtake 1
+	s.enqueue(0, 80, 3, 1050);  // due 1130
+	s.pump(fire, 1050);
 	CHECK(fired.empty());
-	s.pump(1100, fire);
+	s.pump(fire, 1100);
 	CHECK(fired == (std::vector<int>{ 1, 2 }));
-	s.pump(1129, fire);
+	s.pump(fire, 1129);
 	CHECK(fired.size() == 2);
-	s.pump(1130, fire);
+	s.pump(fire, 1130);
 	CHECK(fired == (std::vector<int>{ 1, 2, 3 }));
 	CHECK(s.pending() == 0);
 	printf("  the delay pipe never reorders: ok\n");
@@ -157,18 +157,18 @@ static void test_spike_cycle() {
 	s.set_spike_interval_s(1.0f);
 	s.set_spike_duration_s(0.2f);
 	auto none = [](int &) {};
-	s.pump(1000, none);
-	s.pump(1500, none);
+	s.pump(none, 1000);
+	s.pump(none, 1500);
 	CHECK(!s.spike_active());
 	CHECK(s.delay_ms() == 0);
-	s.pump(2000, none);
+	s.pump(none, 2000);
 	CHECK(s.spike_active());
 	CHECK(s.delay_ms() == 300); // a spike overrides the (zero) latency range
-	s.pump(2100, none);
+	s.pump(none, 2100);
 	CHECK(s.spike_active());
-	s.pump(2200, none);
+	s.pump(none, 2200);
 	CHECK(!s.spike_active());
-	s.pump(3200, none);
+	s.pump(none, 3200);
 	CHECK(s.spike_active());
 	s.set_spike_ms(0); // disabling clears a spike in flight
 	CHECK(!s.spike_active());
@@ -190,20 +190,20 @@ static void test_uncapped_link_is_just_latency() {
 	Sim s;
 	s.set_latency_min_ms(30);
 	s.set_latency_max_ms(30);
-	CHECK(s.schedule(1000, 2, 5000, true) == 30);
-	CHECK(s.schedule(1000, 2, 5000, true) == 30); // no backlog builds without a cap
+	CHECK(s.schedule(2, 5000, true, 1000) == 30);
+	CHECK(s.schedule(2, 5000, true, 1000) == 30); // no backlog builds without a cap
 	printf("  no cap: just the latency draw: ok\n");
 }
 
 static void test_capped_link_serializes() {
 	Sim s = link_sim(1000, 100000); // 1 byte per ms
 	for (int i = 1; i <= 10; i++) {
-		CHECK(s.schedule(1000, 2, 100, true) == 100 * i); // each waits for the ones ahead of it
+		CHECK(s.schedule(2, 100, true, 1000) == 100 * i); // each waits for the ones ahead of it
 	}
-	CHECK(s.backlog_ms(1000, 2) == 1000.0);
-	CHECK(s.backlog_ms(1600, 2) == 400.0); // drains in real time
-	CHECK(s.backlog_ms(2500, 2) == 0.0);
-	CHECK(s.schedule(2500, 2, 100, true) == 100); // an idle link starts from now
+	CHECK(s.backlog_ms(2, 1000) == 1000.0);
+	CHECK(s.backlog_ms(2, 1600) == 400.0); // drains in real time
+	CHECK(s.backlog_ms(2, 2500) == 0.0);
+	CHECK(s.schedule(2, 100, true, 2500) == 100); // an idle link starts from now
 	printf("  a capped link serializes sends and drains in real time: ok\n");
 }
 
@@ -212,14 +212,14 @@ static void test_overhead_and_latency_add() {
 	s.set_packet_overhead(40);
 	s.set_latency_min_ms(50);
 	s.set_latency_max_ms(50);
-	CHECK(s.schedule(0, 2, 60, true) == 100 + 50); // (60 + 40) bytes, then the leg's latency
+	CHECK(s.schedule(2, 60, true, 0) == 100 + 50); // (60 + 40) bytes, then the leg's latency
 	printf("  per-send overhead and latency stack on transmit time: ok\n");
 }
 
 static void test_links_are_independent() {
 	Sim s = link_sim(1000, 100000);
-	s.schedule(0, 2, 5000, true);
-	CHECK(s.schedule(0, 3, 100, true) == 100); // peer 3's link isn't behind peer 2's
+	s.schedule(2, 5000, true, 0);
+	CHECK(s.schedule(3, 100, true, 0) == 100); // peer 3's link isn't behind peer 2's
 	printf("  one client's slow link doesn't delay another's: ok\n");
 }
 
@@ -227,18 +227,18 @@ static void test_full_buffer_drops_only_droppable() {
 	Sim s = link_sim(1000, 250);
 	int dropped = 0, reliable_queued = 0;
 	for (int i = 0; i < 10; i++) {
-		if (s.schedule(0, 2, 100, true) < 0) {
+		if (s.schedule(2, 100, true, 0) < 0) {
 			dropped++;
 		}
 	}
 	CHECK(dropped == 7); // 0, 100, 200 ms of backlog are within the buffer; past 250 drops
 	for (int i = 0; i < 3; i++) {
-		if (s.schedule(0, 2, 100, false) > 0) {
+		if (s.schedule(2, 100, false, 0) > 0) {
 			reliable_queued++;
 		}
 	}
 	CHECK(reliable_queued == 3); // reliable sends always queue (the transport would retransmit)
-	CHECK(s.backlog_ms(0, 2) == 600.0);
+	CHECK(s.backlog_ms(2, 0) == 600.0);
 	printf("  a full buffer drops unreliable sends and queues reliable ones: ok\n");
 }
 
@@ -246,12 +246,12 @@ static void test_link_queues_release_independently() {
 	Sim s;
 	std::vector<int> fired;
 	auto fire = [&](int &p) { fired.push_back(p); };
-	s.enqueue(0, 2, 500, 1); // a backed-up link
-	s.enqueue(0, 3, 20, 2);  // a clear one, queued after it
-	s.pump(20, fire);
+	s.enqueue(2, 500, 1, 0); // a backed-up link
+	s.enqueue(3, 20, 2, 0);  // a clear one, queued after it
+	s.pump(fire, 20);
 	CHECK(fired == std::vector<int>{ 2 });
 	s.forget_link(2); // its peer left: what it had queued goes with it
-	s.pump(600, fire);
+	s.pump(fire, 600);
 	CHECK(fired == std::vector<int>{ 2 });
 	CHECK(s.pending() == 0);
 	printf("  links release independently; a forgotten link's queue is dropped: ok\n");

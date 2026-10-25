@@ -148,11 +148,11 @@ struct ServerApp : goldnet::ServerHost<Value> {
 			return;
 		}
 		const uint32_t now = now_ms();
-		const int delay = netsim.schedule(now, peer, o.bytes.size(), true);
+		const int delay = netsim.schedule(peer, o.bytes.size(), true, now);
 		if (delay == 0) {
 			transmit(o);
 		} else if (delay > 0) {
-			netsim.enqueue(now, peer, delay, std::move(o));
+			netsim.enqueue(peer, delay, std::move(o), now);
 		}
 	}
 
@@ -552,7 +552,7 @@ struct ServerApp : goldnet::ServerHost<Value> {
 	uint32_t poll() {
 		uint32_t now = now_ms();
 		receive(now);
-		netsim.pump(now, [&](Outgoing &o) { transmit(o); });
+		netsim.pump([&](Outgoing &o) { transmit(o); }, now);
 		int caught_up = 0;
 		while ((int32_t)(now - next_tick) >= 0 && caught_up++ < 5) {
 			game_tick(now);
@@ -563,7 +563,7 @@ struct ServerApp : goldnet::ServerHost<Value> {
 					drop_peer(id, "timed out");
 				}
 			}
-			server.tick(now, *this);
+			server.tick(*this, now);
 			next_tick = start_ms + (uint32_t)((uint64_t)++ticks * 1000 / TICK_HZ);
 		}
 		if ((int32_t)(now - next_tick) > 100) { // far behind (a debugger, a stall): don't spin to catch up
