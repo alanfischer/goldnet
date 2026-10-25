@@ -1340,6 +1340,33 @@ static void test_forgotten_entity_takes_no_delta() {
 	printf("  a forgotten entity takes no delta: ok\n");
 }
 
+// A runtime entity is one call each way: add_entity with its spawn record, and remove_entity or
+// despawn, either of which ends both.
+static void test_spawned_entity_is_one_registration() {
+	for (int by_despawn = 0; by_despawn < 2; by_despawn++) {
+		Net n;
+		Peer &a = n.add_peer(2);
+		a.creates[500] = { 500, 2 };
+		n.world.ents[50].vals = { 7, 8 };
+		n.world.key_of[500] = 50;
+		EntityLayout l;
+		l.slots = 2;
+		l.stepped.assign(2, 1);
+		l.kinds_check = 7;
+		n.server.add_entity(500, l, TestServer::SpawnRecord());
+		n.tick();
+		CHECK(a.spawned == std::vector<uint32_t>{ 500 } && (a.vals[500] == std::vector<Val>{ 7, 8 }));
+		CHECK(by_despawn ? n.server.despawn(500) : n.server.remove_entity(500));
+		n.world.ents.erase(50);
+		n.tick();
+		n.tick();
+		CHECK(a.despawned == std::vector<uint32_t>{ 500 });
+		CHECK(!n.server.find(500) && n.server.spawns().empty());
+		CHECK(!n.server.remove_entity(500) && !n.server.despawn(500)); // nothing left at it
+	}
+	printf("  a spawned entity is one call to add, and either call to remove: ok\n");
+}
+
 // A despawn drops the spawn's entity from the client's frames with no word from the host, so an id
 // spawned again takes its first delta only after it arrives whole.
 static void test_despawn_drops_the_entity() {
@@ -1756,6 +1783,7 @@ int main() {
 	test_kinds_mismatch_refuses_entity();
 	test_removed_entity_leaves_client_frame();
 	test_forgotten_entity_takes_no_delta();
+	test_spawned_entity_is_one_registration();
 	test_despawn_drops_the_entity();
 	test_rate_chokes_to_the_budget();
 	test_charged_traffic_delays_the_next_snapshot();

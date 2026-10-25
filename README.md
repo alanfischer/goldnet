@@ -36,10 +36,12 @@ the frame that peer last acked. An entity with nothing changed costs nothing, an
 nothing in it isn't sent (apart from a header-only keepalive every 250 ms, so the client's clock
 feed never goes quiet).
 
-**Spawns.** An entity both ends already know about (one that loads with the map) only needs
-`add_entity`. A runtime entity also gets `add_spawn` with your own recipe bytes, which goes to
-each peer reliable-until-acked, ahead of the entity deltas in the same packet. Despawns go only
-to peers that received the spawn, the same way.
+**Spawns.** An entity both ends already know about (one that loads with the map) is just
+`add_entity(net_id, layout)`. A runtime entity is `add_entity(net_id, layout, record)`, with your
+own recipe bytes in the record, which goes to each peer reliable-until-acked, ahead of the entity
+deltas in the same packet. `despawn(net_id)` (or `remove_entity`, the same) ends it, and the
+despawn goes only to peers that received the spawn, the same way. A recipe that creates several
+entities, or none, is `add_spawn` on its own.
 
 **The packet budget.** The entity section gets whatever a safe UDP payload (1200 bytes) has left,
 so a joining client's first full frame or a burst of changes can't overrun the MTU. Anything that
@@ -86,7 +88,7 @@ server.set_packet_overhead(28);     // IPv4 + UDP, for rate budgets
 server.set_snapshot_rate(60);       // how often you call tick()
 
 server.add_entity(net_id, layout);  // starts replicating (EntityLayout: its slots); remove_entity(net_id)
-server.add_spawn(net_id, record);   // a runtime entity clients must create; despawn(net_id)
+server.add_entity(net_id, layout, record);  // a runtime entity clients must create; despawn(net_id)
 server.mark_dirty(net_id);          // a pushed slot was written (EntityLayout::push)
 
 server.add_peer(peer);              // on connect; remove_peer(peer) on disconnect

@@ -44,14 +44,17 @@
 // can refuse them.
 //
 // Spawns. An entity the client already has (one loaded with the map, at the same net_id on both
-// ends) needs only add_entity. A runtime entity, which the client has no other way to know about,
-// is two registrations under one net_id, and the host makes both:
+// ends) needs only add_entity(net_id, layout). A runtime entity, which the client has no other way
+// to know about, also needs a spawn record telling each peer to create it (record.data is the
+// host's recipe), and takes it in the same call:
 //
-//   add_spawn(net_id, record)          tells each peer to create it; record.data is the host's recipe
-//   add_entity(net_id, layout)         streams its slot state, like any other entity
+//   add_entity(net_id, layout, record)
 //
-// and when it's destroyed, despawn(net_id) and remove_entity(net_id). Calling both on the same tick
-// is fine: a snapshot carries its spawns ahead of its entity deltas. A spawn reaches a peer the
+// When it's destroyed, remove_entity(net_id) or despawn(net_id) (the two are the same) stops its
+// state and despawns it. A spawn that isn't one entity, one whose recipe creates several or none,
+// is add_spawn(net_id, record) on its own, with the entities it creates named in record.entities
+// and added under their own net_ids; despawn(net_id) ends it. A snapshot carries its spawns ahead
+// of its entity deltas, so they can be added on the same tick. A spawn reaches a peer the
 // first time the entity is visible to it (see SpawnRecord::entities), goes in that snapshot and
 // the RELIABLE_BACKUP after it, then again whenever it is overdue, until the peer acks a snapshot
 // carrying it; the despawn reaches only peers that got it, the same way. Until a spawn is proven
@@ -211,25 +214,18 @@ public:
 		return *e;
 	}
 
-	// Order-preserving, so the packet order of everything else is unaffected.
+	// A runtime entity: add_entity, and the spawn record that tells each peer to create it (add_spawn),
+	// in one call.
+	Entity &add_entity(uint32_t p_net_id, EntityLayout p_layout, SpawnRecord p_spawn) {
+		add_spawn(p_net_id, std::move(p_spawn));
+		return add_entity(p_net_id, std::move(p_layout));
+	}
+
+	// Stop replicating the entity at p_net_id, and despawn it if it was spawned: the same as despawn.
+	// False if neither was registered.
 	bool remove_entity(uint32_t p_net_id) {
-		auto it = index_.find(p_net_id);
-		if (it == index_.end()) {
-			return false;
-		}
-		const size_t idx = it->second;
-		index_.erase(it);
-		ents_.erase(ents_.begin() + idx);
-		for (auto &kv : index_) {
-			if (kv.second > idx) {
-				kv.second--;
-			}
-		}
-		for (auto &kv : rings_) {
-			erase_wait(kv.second, p_net_id);
-		}
-		order_stale_ = true;
-		return true;
+		const bool removed = erase_entity(p_net_id);
+		return retire_spawn(p_net_id) || removed;
 	}
 
 	Entity *find(uint32_t p_net_id) {
@@ -238,6 +234,7 @@ public:
 	}
 
 	const std::vector<Entity> &entities() const { return ents_; }
+
 
 	// The next tick reads this entity's declared (pushed) slots too. False if it isn't registered.
 	bool mark_dirty(uint32_t p_net_id) {
@@ -275,27 +272,10 @@ public:
 
 	const std::unordered_map<uint32_t, SpawnRecord> &spawns() const { return spawns_; }
 
-	// A spawned entity was destroyed: it becomes a despawn owed to every peer that RECEIVED the
-	// spawn. With lazy spawning, peers that never saw the entity never got the spawn, so they're
-	// owed nothing — scope the despawn to peers holding it (delivered) or mid-receiving it.
-	void despawn(uint32_t p_net_id) {
-		if (spawns_.erase(p_net_id) == 0) {
-			return;
-		}
-		std::unordered_set<int32_t> needers;
-		for (auto &kv : rings_) {
-			PeerRing &pr = kv.second;
-			if (pr.spawn_acked.count(p_net_id) || pr.spawn_wait.count(p_net_id)) {
-				needers.insert(kv.first);
-			}
-			pr.spawn_wait.erase(p_net_id);  // stop resending the (now void) spawn
-			pr.spawn_acked.erase(p_net_id); // and forget delivery, so a reused id re-spawns cleanly
-			erase_wait(pr, p_net_id);       // and stop tracking overflow-priority for a dead entity
-		}
-		if (!needers.empty()) { // joining any peers still owed an earlier use of the id
-			despawn_pending_[p_net_id].insert(needers.begin(), needers.end());
-		}
-	}
+	// A spawned entity was destroyed: its spawn ends, and the entity at its net_id stops replicating
+	// (the same as remove_entity). False if neither was registered.
+	bool despawn(uint32_t p_net_id) { return remove_entity(p_net_id); }
+
 
 	// --- Peers ---
 
@@ -445,6 +425,50 @@ public:
 	void tick(Host &p_host, uint32_t p_now);
 
 private:
+	// Order-preserving, so the packet order of everything else is unaffected.
+	bool erase_entity(uint32_t p_net_id) {
+		auto it = index_.find(p_net_id);
+		if (it == index_.end()) {
+			return false;
+		}
+		const size_t idx = it->second;
+		index_.erase(it);
+		ents_.erase(ents_.begin() + idx);
+		for (auto &kv : index_) {
+			if (kv.second > idx) {
+				kv.second--;
+			}
+		}
+		for (auto &kv : rings_) {
+			erase_wait(kv.second, p_net_id);
+		}
+		order_stale_ = true;
+		return true;
+	}
+
+	// The spawn at p_net_id ends: a despawn owed to every peer that RECEIVED it. With lazy spawning,
+	// peers that never saw the entity never got the spawn, so they're owed nothing — scope the
+	// despawn to peers holding it (delivered) or mid-receiving it.
+	bool retire_spawn(uint32_t p_net_id) {
+		if (spawns_.erase(p_net_id) == 0) {
+			return false;
+		}
+		std::unordered_set<int32_t> needers;
+		for (auto &kv : rings_) {
+			PeerRing &pr = kv.second;
+			if (pr.spawn_acked.count(p_net_id) || pr.spawn_wait.count(p_net_id)) {
+				needers.insert(kv.first);
+			}
+			pr.spawn_wait.erase(p_net_id);  // stop resending the (now void) spawn
+			pr.spawn_acked.erase(p_net_id); // and forget delivery, so a reused id re-spawns cleanly
+			erase_wait(pr, p_net_id);       // and stop tracking overflow-priority for a dead entity
+		}
+		if (!needers.empty()) { // joining any peers still owed an earlier use of the id
+			despawn_pending_[p_net_id].insert(needers.begin(), needers.end());
+		}
+		return true;
+	}
+
 	// A stepped slot's value as of counter p_ctr, or null if that has left its history or the
 	// baseline predates the entity. With no change recorded at or before p_ctr and the history never
 	// full, the slot hadn't moved from where every entity's slots start, V().
