@@ -95,7 +95,7 @@ struct Interp {
 	}
 };
 
-struct ClientCore {
+struct ClientCore : goldnet::ClientHost<Value> {
 	struct Ent {
 		uint8_t kind = 0;
 		uint8_t color = 0;
@@ -168,10 +168,10 @@ struct ClientCore {
 	Stats cur, last;
 	uint32_t next_stats = 0;
 
-	// --- goldnet's host interface (Client::apply) ---
+	// --- goldnet's host interface (ClientHost) ---
 
-	void protocol_mismatch() { fprintf(stderr, "[client] the server speaks a different version\n"); }
-	void server_time(uint32_t ms) {
+	void protocol_mismatch() override { fprintf(stderr, "[client] the server speaks a different version\n"); }
+	void server_time(uint32_t ms) override {
 		server_ms = ms;
 		fresh = true;
 		const double off = (double)now_ms() - (double)ms;
@@ -182,7 +182,7 @@ struct ClientCore {
 			clock_offset += (off - clock_offset) * 0.01; // drift and route changes, slowly
 		}
 	}
-	void message(const uint8_t *data, size_t size, bool) {
+	void message(const uint8_t *data, size_t size, bool) override {
 		if (size >= 5 && data[0] == MSG_YOU) {
 			my_id = get_u32_le(data + 1);
 			auto it = ents.find(my_id);
@@ -197,7 +197,7 @@ struct ClientCore {
 			}
 		}
 	}
-	bool spawn(uint32_t net_id, uint32_t, const uint8_t *data, size_t size) {
+	bool spawn(uint32_t net_id, uint32_t, const uint8_t *data, size_t size) override {
 		if (size < 1) {
 			return true;
 		}
@@ -227,7 +227,7 @@ struct ClientCore {
 		}
 		return true;
 	}
-	void despawn(uint32_t net_id) {
+	void despawn(uint32_t net_id) override {
 		auto it = ents.find(net_id);
 		if (it == ents.end()) {
 			return;
@@ -240,27 +240,22 @@ struct ClientCore {
 		}
 		ents.erase(it);
 	}
-	void relevance_lost(uint32_t) {}
-	bool registered(uint32_t net_id) { return ents.count(net_id) > 0; }
-	uint32_t cur_id = 0;
-	int begin_entity(uint32_t net_id, uint32_t, bool, uint8_t, bool &) {
-		auto it = ents.find(net_id);
+	EntityResult entity(EntityUpdate<Value> &u) override {
+		auto it = ents.find(u.net_id());
 		if (it == ents.end()) {
-			return -1;
+			return ENTITY_SKIP;
 		}
-		cur_id = net_id;
-		return (int)it->second.vals.size();
-	}
-	bool set_slot(int slot, const Value &v) {
-		ents[cur_id].vals[slot] = v;
-		return true;
-	}
-	void end_entity(bool applied) {
-		if (applied) {
-			ents[cur_id].has_state = true;
+		Ent &e = it->second;
+		for (int s : u.changed()) {
+			const Value v = decode_value(u.reader());
+			u.set(s, v);
+			if ((size_t)s < e.vals.size()) {
+				e.vals[s] = v;
+				e.has_state = true;
+			}
 		}
+		return ENTITY_APPLIED;
 	}
-	Value decode(Reader &r, int, const Value *, uint32_t) { return decode_value(r); }
 
 	// --- the session ---
 

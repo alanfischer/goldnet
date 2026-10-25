@@ -24,9 +24,10 @@ reliable replication drops clients.
 **Templated on your engine.** `goldnet::Server<V, X>` and `goldnet::Client<V>` are templates over
 your value type `V` (default-constructible, copyable, comparable with `!=`) and optional
 per-entity storage `X`. They reach your engine only through a host object you pass in: read a
-slot, test visibility, encode a value, send bytes. The full list of host methods is at the top of
-`server.h` and `client.h`. goldnet never looks inside a value; it compares them, stores them and
-hands them back to you to encode.
+slot, test visibility, encode a value, send bytes. Derive your host from `goldnet::ServerHost` or
+`goldnet::ClientHost` and you write only the few methods every game needs; the rest default to a game
+that doesn't use that feature (see **Using it**). goldnet never looks inside a value; it compares
+them, stores them and hands them back to you to encode.
 
 **Entities are slots.** An entity is a `net_id` and a fixed list of slots (position x, y, z, a
 yaw, a score, ...). Every tick the server reads each live entity's slots once, records which ones
@@ -81,7 +82,7 @@ goldnet::Server<MyValue> server;
 server.set_packet_overhead(28);     // IPv4 + UDP, for rate budgets
 server.set_snapshot_rate(60);       // how often you call tick()
 
-server.add_entity(key, net_id);     // starts replicating; remove_entity(key)
+server.add_entity(key, net_id, layout);  // starts replicating (EntityLayout: its slots); remove_entity(key)
 server.add_spawn(net_id, record);   // a runtime entity clients must create; despawn(net_id)
 server.mark_dirty(key);             // a pushed slot was written (EntityLayout::push)
 
@@ -89,15 +90,29 @@ server.add_peer(peer);              // on connect; remove_peer(peer) on disconne
 server.tick(now_ms, host);          // every tick: reads state, sends each due peer a snapshot
 server.peer_stats(peer);            // its rate, chokes, uplink report and netchan counts
 
+server.set_command_schema(stream_id, schema);  // a command stream's fields, as the client names them
 server.receive_uplink(peer, bytes, size, host, now_ms);  // each uplink packet from a peer
 // host gets command() and message() in order; the server takes the acks, rate and update rate
+```
+
+The server's host, one object for `tick()` and `receive_uplink()`:
+
+```cpp
+struct MyServerHost : goldnet::ServerHost<MyValue> {
+    void read(Entity &e, bool polled_only) override;  // server.stamp(e, slot, value) for each slot
+    void encode(goldnet::Writer &w, const Entity &e, int slot, const MyValue *base, uint32_t now) override;
+    void send(int32_t peer, const goldnet::Writer &packet) override;
+    // As you need them: live, visible, spawn_visible, command, message, command_schema, protocol_mismatch
+};
 ```
 
 Client:
 
 ```cpp
 goldnet::Client<MyValue> client;
-client.apply(bytes, size, host, now_ms);  // each snapshot; client.reset() for a new session
+client.apply(bytes, size, host, now_ms);  // each snapshot; .status says why one wasn't taken
+client.forget(net_id);  // an entity the host did away with, other than by its despawn
+// client.reset() for a new session
 
 client.push_command(stream_id, bytes, size, now_ms);  // one command; returns its seq
 client.set_rate(25000);           // what to ask the server for; or set_auto_rate(true)
@@ -107,6 +122,29 @@ if (client.uplink_due(now_ms)) {  // commands, messages, or an ack the server is
 }
 client.stats();                   // arrivals, lag, the rates in force, commands and messages
 ```
+
+The client's host:
+
+```cpp
+struct MyClientHost : goldnet::ClientHost<MyValue> {
+    goldnet::EntityResult entity(goldnet::EntityUpdate<MyValue> &u) override {
+        Thing *t = find(u.net_id());
+        if (!t) return goldnet::ENTITY_SKIP;       // not one we have: its bytes are stepped over
+        for (int s : u.changed()) {                // each changed slot, in order
+            MyValue v = decode(u.reader(), s, u.base(s));  // as your encode wrote it
+            u.set(s, v);                           // the next delta's base
+            t->apply(s, v);
+        }
+        return goldnet::ENTITY_APPLIED;
+    }
+    // As you need them: spawn, despawn, relevance_lost, server_time, message, protocol_mismatch
+};
+```
+
+Mark each method `override`, so a misspelt one fails to compile instead of quietly leaving the
+default in place. The bases are optional: the server and client call whatever the host object they're
+handed has, so a host that defines every method needn't derive from anything. The contract for each
+method is at the top of `server.h` and `client.h`.
 
 Connection management (timeouts, saying hello, deciding who is a peer) is up to you; the server
 serves only the peers you add. Both examples show a

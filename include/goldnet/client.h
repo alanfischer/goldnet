@@ -16,7 +16,14 @@
 // The rate and the command rate can each be picked automatically instead (auto_rate.h): the rate
 // from how far behind the downlink arrives, the command rate from the server's report of the uplink.
 //
-// The host passed to apply() provides:
+// The host passed to apply() provides the following. Deriving it from ClientHost (at the end of this
+// file) leaves only entity() to write; the rest default to a game that doesn't use them.
+//
+//   EntityResult entity(EntityUpdate<V> &u)
+//        one entity's changed slots (EntityUpdate): decode each from u.reader(), as the server host's
+//        encode wrote it, hand it to u.set(), and apply it. ENTITY_SKIP an entity the host doesn't have (its
+//        slots are stepped over), or one sent whole() whose kinds_check says it would read the slots
+//        differently; ENTITY_NOT_READY one it has but can't take values for yet (warmup), which holds the ack.
 //   void protocol_mismatch()                       a different build is talking to us (once per session)
 //   void server_time(uint32_t ms)                  every in-order snapshot's header clock, before
 //                                                  any of its values are applied
@@ -25,16 +32,10 @@
 //        create it; false = can't yet: the frame isn't acked, so the spawn is offered again
 //   void despawn(uint32_t net_id)                  only for an id whose spawn() returned true
 //   void relevance_lost(uint32_t net_id)
-//   bool registered(uint32_t net_id)               does an entity with this id exist here?
-//   int  begin_entity(uint32_t net_id, uint32_t mask, bool whole, uint8_t kinds_check, bool &r_defer)
-//        slot count of a live target, or -1 if none (its slots are then stepped over); r_defer =
-//        known but not ready (warmup). On a whole entity, kinds_check is the server host's summary
-//        of how it codes the slots: a host that would read them differently returns -1.
-//   V    decode(Reader &r, int slot, const V *base, uint32_t ref_time_ms)
-//        the current target's slot, as the server host's encode wrote it: its change from base,
-//        the value at the baseline, or whole when base is null
-//   bool set_slot(int slot, const V &v)            apply to the current target; true if applied
-//   void end_entity(bool applied)                  the current target is done
+//
+// The client keeps each entity's values at recent frames, to apply the next delta to. A despawn drops
+// the spawn's own entity from them; a host that does away with any other entity it had (a map change,
+// say) calls forget() with its id.
 //
 // Messages are delivered from any snapshot newer than every one before it, committed or not:
 // the reliable ones before the spawns, the datagram's after the entity deltas and before the
@@ -55,11 +56,100 @@
 
 namespace goldnet {
 
+// The slots set in a mask, lowest first: for (int s : SlotMask{ mask }).
+struct SlotMask {
+	uint32_t bits = 0;
+
+	struct iterator {
+		uint32_t rest;
+		int operator*() const {
+			int s = 0;
+			while (!(rest & (1u << s))) {
+				s++;
+			}
+			return s;
+		}
+		iterator &operator++() {
+			rest &= rest - 1;
+			return *this;
+		}
+		bool operator!=(const iterator &p_other) const { return rest != p_other.rest; }
+	};
+	iterator begin() const { return { bits }; }
+	iterator end() const { return { 0 }; }
+};
+
+// What the host's entity() made of an EntityUpdate.
+enum EntityResult : uint8_t {
+	ENTITY_APPLIED,   // decoded and applied, each slot handed to EntityUpdate::set
+	ENTITY_SKIP,      // not an entity the host has, or one it would read differently: its slots are stepped over
+	ENTITY_NOT_READY, // the host has it but can't take values yet: the snapshot isn't acked, so it comes again
+};
+
+template <class V>
+class Client;
+
+// What the host's entity() gets: one entity's changed slots in a snapshot.
+template <class V>
+class EntityUpdate {
+public:
+	uint32_t net_id() const { return net_id_; }
+	// Every slot, none against a base: the first the client sees of it, or a resend in full.
+	bool whole() const { return whole_; }
+	// With whole(): the server host's summary of how it codes the slots (EntityLayout::kinds_check).
+	uint8_t kinds_check() const { return kinds_check_; }
+	// The snapshot's header clock, ms, for a slot coded against it.
+	uint32_t server_time() const { return server_time_; }
+	// The changed slots, lowest first; each one's bytes are next in reader().
+	SlotMask changed() const { return { mask_ }; }
+	Reader &reader() { return reader_; }
+	// The value the client holds for a slot at the snapshot's baseline, which a slot coded as a change
+	// is a change from; null when whole().
+	const V *base(int p_slot) const {
+		return base_ && (size_t)p_slot < base_->size() ? &(*base_)[p_slot] : nullptr;
+	}
+	// The slot's decoded value, which the next snapshot's base() gives back. Every changed slot must
+	// be set, or the snapshot isn't one to ack.
+	void set(int p_slot, const V &p_value) {
+		if (p_slot < 0 || p_slot >= MAX_SLOTS) {
+			return;
+		}
+		if ((size_t)p_slot >= vals_.size()) {
+			vals_.resize(p_slot + 1);
+		}
+		vals_[p_slot] = p_value;
+		set_ |= 1u << p_slot;
+	}
+
+private:
+	friend class Client<V>;
+	EntityUpdate(uint32_t p_net_id, bool p_whole, uint8_t p_kinds_check, uint32_t p_server_time, uint32_t p_mask,
+			const uint8_t *p_data, size_t p_size, const std::vector<V> *p_base) :
+			net_id_(p_net_id), whole_(p_whole), kinds_check_(p_kinds_check), server_time_(p_server_time),
+			mask_(p_mask), reader_(p_data, p_size), base_(p_whole ? nullptr : p_base) {
+		if (base_) {
+			vals_ = *base_;
+		}
+	}
+
+	uint32_t net_id_;
+	bool whole_;
+	uint8_t kinds_check_;
+	uint32_t server_time_;
+	uint32_t mask_;
+	Reader reader_;
+	const std::vector<V> *base_;
+	std::vector<V> vals_; // the base's values, with the slots set over them
+	uint32_t set_ = 0;
+};
+
 template <class V>
 class Client {
 public:
-	// What the last apply() saw, for a host's debug print.
+	// What apply() made of a snapshot: why it wasn't taken, if it wasn't, and what it saw, for a
+	// host's debug print.
 	struct ApplyInfo {
+		Status status = STATUS_OK;
 		uint16_t seq = 0;
 		uint16_t base_seq = 0;
 		int spawns = 0;
@@ -119,6 +209,16 @@ public:
 		st.messages_delivered = uplink_.reliable_delivered();
 		st.overflowed = uplink_.overflowed();
 		return st;
+	}
+
+	// The host no longer has this entity, by any way but its despawn: the client stops holding its
+	// values, so a later delta for it isn't applied to something new at the same id. Safe from
+	// inside the host's callbacks.
+	void forget(uint32_t p_net_id) {
+		for (int i = 0; i < RING; i++) {
+			frames_[i].erase(p_net_id);
+		}
+		forgotten_.push_back(p_net_id);
 	}
 
 	// A fresh session: old baselines are meaningless.
@@ -237,6 +337,8 @@ private:
 	// Spawns the host accepted. Spawns and despawns are resent until acked, so the same one can
 	// arrive many times; this is what lets the host see each exactly once.
 	std::unordered_set<uint32_t> spawned_;
+	// Ids forget() was given during the apply() underway, for the frame it's building.
+	std::vector<uint32_t> forgotten_;
 	bool warned_mismatch_ = false;
 	// Consecutive frames deferred because a KNOWN entity wasn't ready yet. Capped so an entity that
 	// never resolves can't stall the stream forever; after the cap we accept the frame and move on.
@@ -292,14 +394,21 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	ApplyInfo info;
 	Reader r(p_data, p_size);
 	received_bytes_ += p_size + (size_t)packet_overhead_;
+	forgotten_.clear(); // any before this apply are out of the frames already
 
 	// Protocol guard: a mismatched build (different wire format) would misparse every field. Fail
 	// loudly once and drop, rather than flooding the log with decode errors.
-	if (r.get_u8() != WIRE_VERSION) {
+	const uint8_t version = r.get_u8();
+	if (r.failed()) {
+		info.status = STATUS_MALFORMED;
+		return info;
+	}
+	if (version != WIRE_VERSION) {
 		if (!warned_mismatch_) {
 			warned_mismatch_ = true;
 			p_host.protocol_mismatch();
 		}
+		info.status = STATUS_MISMATCH;
 		return info;
 	}
 
@@ -315,6 +424,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	info.seq = seq;
 	info.base_seq = base_seq;
 	if (r.failed()) {
+		info.status = STATUS_MALFORMED;
 		return info;
 	}
 	count_arrival(seq);
@@ -323,6 +433,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	// newer than the last committed one but not the last received is stale too: GoldSrc drops any
 	// packet older than the newest, and its messages must never play after a newer packet's.
 	if ((has_ && !seq_newer(seq, last_seq_)) || !chan_.accept(seq)) {
+		info.status = STATUS_STALE;
 		return info;
 	}
 	uplink_.on_channel_ack(chan.ack, p_now);
@@ -330,6 +441,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	std::vector<std::vector<uint8_t>> reliable;
 	std::vector<std::vector<uint8_t>> unreliable;
 	if (!chan.take(chan_, p_now, reliable, unreliable)) {
+		info.status = STATUS_MALFORMED;
 		return info;
 	}
 	auto deliver = [&p_host](std::vector<std::vector<uint8_t>> &p_msgs, bool p_reliable) {
@@ -363,6 +475,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 			if (has_) {
 				queue_ack(last_seq_, info);
 			}
+			info.status = STATUS_NO_BASELINE;
 			return info;
 		}
 	}
@@ -430,49 +543,28 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 
 		// Start from this entity's baseline values, then overlay the changed slots. A change can only
 		// be applied to the value it is a change from, so a delta for an entity missing from the
-		// baseline frame can't be applied at all.
+		// baseline frame can't be applied at all: the host is offered no slots, and can only say
+		// whether it has the entity.
 		auto cur = frame.find(net_id);
-		bool defer = false;
-		const int n_slots = p_host.begin_entity(net_id, mask, whole, kinds_check, defer);
-		if (defer) {
+		const bool held = whole || cur != frame.end();
+		EntityUpdate<V> u(net_id, whole, kinds_check, server_time, held ? mask : 0, data, len,
+				cur != frame.end() ? &cur->second : nullptr);
+		const EntityResult res = p_host.entity(u);
+		if (res == ENTITY_NOT_READY) {
 			defer_ack = true;
 		}
-		if (n_slots < 0) {
+		if (res != ENTITY_APPLIED) {
 			continue;
 		}
-		if (!whole && cur == frame.end()) {
+		if (!held) {
 			// Known here, but not held at the baseline the server thinks it is: hold the ack, so the
 			// server keeps diffing against a frame we have, until the cap gives up.
 			defer_ack = true;
-			p_host.end_entity(false);
-			continue;
-		}
-		std::vector<V> vals;
-		if (cur != frame.end()) {
-			vals = cur->second;
-		}
-		vals.resize(n_slots);
-		Reader vr(data, len);
-		bool applied = false;
-		for (int s = 0; s < n_slots && s < MAX_SLOTS; s++) {
-			if (!(mask & (1u << s))) {
-				continue;
-			}
-			V v = p_host.decode(vr, s, whole ? nullptr : &vals[s], server_time);
-			if (vr.failed()) {
-				break;
-			}
-			vals[s] = v;
-			if (p_host.set_slot(s, v)) {
-				applied = true;
-			}
-		}
-		if (vr.failed()) {
+		} else if (u.reader().failed() || u.set_ != mask) {
 			defer_ack = true; // the host read the slots differently than they were written: not a frame to ack
 		} else {
-			frame[net_id] = std::move(vals);
+			frame[net_id] = std::move(u.vals_);
 		}
-		p_host.end_entity(applied);
 	}
 
 	deliver(unreliable, false);
@@ -480,24 +572,21 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	// A truncated or corrupt packet: whatever it applied stays applied (later snapshots carry the
 	// same state again), but it is not a frame we can baseline against, so don't commit or ack it.
 	if (r.failed()) {
+		info.status = STATUS_MALFORMED;
 		return info;
 	}
 
-	// Now free despawned entities (after the deltas so nothing applies to one we then free).
+	// Now free despawned entities (after the deltas so nothing applies to one we then free), and stop
+	// holding their values, as the server no longer does.
 	for (uint32_t nid : despawns) {
 		if (spawned_.erase(nid)) {
 			p_host.despawn(nid);
 		}
+		frame.erase(nid);
 	}
-
-	// Drop entities no longer registered here (e.g. after a map change / despawn) so the client
-	// baseline can't diverge from the server's, which only tracks live entities.
-	for (auto it = frame.begin(); it != frame.end();) {
-		if (!p_host.registered(it->first)) {
-			it = frame.erase(it);
-		} else {
-			++it;
-		}
+	// And any the host did away with meanwhile (forget()).
+	for (uint32_t nid : forgotten_) {
+		frame.erase(nid);
 	}
 
 	// Relevance leaves: drop from the reconstructed frame (so it matches the server's baseline,
@@ -522,6 +611,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 		if (has_) {
 			queue_ack(last_seq_, info);
 		}
+		info.status = STATUS_HELD;
 		return info;
 	}
 	defer_streak_ = 0;
@@ -573,5 +663,23 @@ void Client<V>::count_arrival(uint16_t p_seq) {
 		arrivals_.lost--; // late, not lost
 	}
 }
+
+// A base for the host Client::apply calls back into: derive from it and define entity(), which it
+// leaves pure. Everything else has a default that suits a game not using the feature, so define only
+// what you use, marked override (see ServerHost).
+template <class V>
+struct ClientHost {
+	virtual ~ClientHost() = default;
+
+	virtual EntityResult entity(EntityUpdate<V> &u) = 0;
+
+	// A spawn is taken, and creates nothing: a game with no runtime entities never gets one.
+	virtual bool spawn(uint32_t, uint32_t, const uint8_t *, size_t) { return true; }
+	virtual void despawn(uint32_t) {}
+	virtual void relevance_lost(uint32_t) {}
+	virtual void server_time(uint32_t) {}
+	virtual void message(const uint8_t *, size_t, bool) {}
+	virtual void protocol_mismatch() {}
+};
 
 } // namespace goldnet

@@ -465,10 +465,10 @@ private:
 // The server end: one sequence per peer, delivered in order.
 class CommandReceiver {
 public:
-	// One uplink packet from p_peer. False if it was malformed or from a mismatched build. p_now: the
-	// host's clock, the one it writes its snapshots by.
+	// One uplink packet from p_peer: false, with the reason, if it was malformed or from a mismatched
+	// build. p_now: the host's clock, the one it writes its snapshots by.
 	template <class Host>
-	bool receive(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now);
+	Result receive(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now);
 
 	// The newest command from p_peer delivered with none missing before it. 0 = none yet.
 	uint16_t ack(int32_t p_peer) const {
@@ -554,11 +554,11 @@ private:
 };
 
 template <class Host>
-bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now) {
+Result CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now) {
 	Reader r(p_data, p_size);
 	const uint8_t version = r.get_u8();
 	if (r.failed()) {
-		return false;
+		return { STATUS_MALFORMED };
 	}
 	if (version != WIRE_VERSION) {
 		Peer &p = peers_[p_peer];
@@ -566,7 +566,7 @@ bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_si
 			p.warned = true;
 			p_host.protocol_mismatch(p_peer);
 		}
-		return false;
+		return { STATUS_MISMATCH };
 	}
 	const uint16_t packet_seq = r.get_u16();
 	const uint16_t snapshot_ack = r.get_u16();
@@ -609,14 +609,14 @@ bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_si
 		}
 		const int si = stream_ct > 1 ? r.get_u8() : 0;
 		if (si >= stream_ct || !get_command(r, schemas[si], prev[si], cmds[i].fields)) {
-			return false;
+			return { STATUS_MALFORMED };
 		}
 		cmds[i].seq = seq;
 		cmds[i].stream = si;
 		prev[si] = &cmds[i].fields;
 	}
 	if (r.failed()) {
-		return false; // nothing from a truncated packet, not even its ack
+		return { STATUS_MALFORMED }; // nothing from a truncated packet, not even its ack
 	}
 
 	if (snapshot_ack != 0) {
@@ -643,7 +643,7 @@ bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_si
 	if (p.chan.accept(packet_seq)) {
 		p_host.channel_ack(p_peer, chan.ack);
 		if (!chan.take(p.chan, p_now, reliable, unreliable)) {
-			return false;
+			return { STATUS_MALFORMED };
 		}
 	}
 	for (const std::vector<uint8_t> &m : reliable) {
@@ -687,7 +687,7 @@ bool CommandReceiver::receive(int32_t p_peer, const uint8_t *p_data, size_t p_si
 	for (const std::vector<uint8_t> &m : unreliable) {
 		p_host.message(p_peer, m.data(), m.size(), false);
 	}
-	return true;
+	return {};
 }
 
 } // namespace goldnet

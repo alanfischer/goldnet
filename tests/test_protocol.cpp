@@ -49,16 +49,6 @@ struct TestServerHost {
 	TestServer *server;
 
 	bool live(TestServer::Entity &e) { return world->ents.count(e.key()) > 0; }
-	EntityLayout prepare(TestServer::Entity &e) {
-		const WorldEnt &w = world->ents[e.key()];
-		EntityLayout l;
-		l.slots = (int)w.vals.size();
-		l.push = w.push;
-		l.priority = w.priority;
-		l.stepped.assign(l.slots, 1);
-		l.kinds_check = 7;
-		return l;
-	}
 	void read(TestServer::Entity &e, bool polled_only) {
 		world->reads++;
 		const WorldEnt &w = world->ents[e.key()];
@@ -80,6 +70,42 @@ struct TestServerHost {
 	}
 };
 
+// --- a game that takes the defaults: hosts derived from ServerHost and ClientHost ---
+
+// One entity's slots as whole ints, and the commands that arrive. Nothing else is defined.
+struct MinimalServerHost : ServerHost<Val> {
+	TestServer *server = nullptr;
+	std::vector<Val> vals;
+	std::vector<std::vector<uint8_t>> sent;
+	std::vector<Command> commands;
+
+	void read(Entity &e, bool) override {
+		for (int s = 0; s < e.slots(); s++) {
+			server->stamp(e, s, vals[s]);
+		}
+	}
+	void encode(Writer &w, const Entity &e, int slot, const Val *, uint32_t) override { put_varint(&w, e.value(slot)); }
+	void send(int32_t, const Writer &w) override { sent.emplace_back(w.data(), w.data() + w.size()); }
+	void command(int32_t, uint32_t, const Command &c) override { commands.push_back(c); }
+};
+
+// Net id 100, with the slots MinimalServerHost sends.
+struct MinimalClientHost : ClientHost<Val> {
+	std::vector<Val> vals;
+
+	EntityResult entity(EntityUpdate<Val> &u) override {
+		if (u.net_id() != 100) {
+			return ENTITY_SKIP;
+		}
+		for (int s : u.changed()) {
+			const Val v = get_varint(&u.reader());
+			u.set(s, v);
+			vals[s] = v;
+		}
+		return ENTITY_APPLIED;
+	}
+};
+
 // --- one client: what it has applied, and what it acked ---
 
 struct Peer {
@@ -91,6 +117,7 @@ struct Peer {
 	std::map<uint32_t, int> synced;           // net_id -> times `synchronized` fired
 	std::vector<uint32_t> spawned, despawned, lost;
 	std::vector<uint16_t> acks;
+	std::vector<Status> statuses; // of every snapshot delivered, in order
 	std::vector<uint32_t> times;
 	std::vector<std::pair<std::vector<uint8_t>, bool>> messages; // bytes, reliable
 	std::vector<std::string> events; // spawns, messages and despawns, in the order the host saw them
@@ -98,7 +125,6 @@ struct Peer {
 	int refuse_spawns = 0; // the host can't create the next N spawns yet
 	uint8_t kinds_check = 7; // how this host reads slots; the server's host says 7
 	std::map<uint32_t, std::pair<uint32_t, int>> creates; // spawn net_id -> the entity it registers
-	uint32_t cur = 0;
 };
 
 struct TestClientHost {
@@ -127,33 +153,31 @@ struct TestClientHost {
 		p->events.push_back("d" + std::to_string(net_id));
 	}
 	void relevance_lost(uint32_t net_id) { p->lost.push_back(net_id); }
-	bool registered(uint32_t net_id) { return p->slot_count.count(net_id) > 0; }
-	int begin_entity(uint32_t net_id, uint32_t mask, bool whole, uint8_t kinds_check, bool &r_defer) {
-		p->cur = net_id;
-		if (!p->slot_count.count(net_id)) {
-			return -1;
+	// Each slot an int, as its step from the baseline value (TestServerHost::encode).
+	EntityResult entity(EntityUpdate<Val> &u) {
+		const uint32_t id = u.net_id();
+		if (!p->slot_count.count(id) || (u.whole() && u.kinds_check() != p->kinds_check)) {
+			return ENTITY_SKIP;
 		}
-		if (whole && kinds_check != p->kinds_check) {
-			return -1;
+		if (p->not_ready.count(id)) {
+			return ENTITY_NOT_READY;
 		}
-		if (p->not_ready.count(net_id)) {
-			r_defer = mask != 0;
-			return -1;
+		std::vector<Val> &vals = p->vals[id];
+		vals.resize(p->slot_count[id]);
+		bool applied = false;
+		for (int s : u.changed()) {
+			const Val v = (u.base(s) ? *u.base(s) : 0) + get_varint(&u.reader());
+			u.set(s, v);
+			if ((size_t)s < vals.size()) {
+				vals[s] = v;
+				applied = true;
+			}
 		}
-		std::vector<Val> &v = p->vals[net_id];
-		v.resize(p->slot_count[net_id]);
-		return p->slot_count[net_id];
-	}
-	bool set_slot(int s, const Val &v) {
-		p->vals[p->cur][s] = v;
-		return true;
-	}
-	void end_entity(bool applied) {
 		if (applied) {
-			p->synced[p->cur]++;
+			p->synced[id]++;
 		}
+		return ENTITY_APPLIED;
 	}
-	Val decode(Reader &r, int, const Val *base, uint32_t) { return (base ? *base : 0) + get_varint(&r); }
 };
 
 struct TestUplinkHost {
@@ -186,9 +210,17 @@ struct Net {
 		return p;
 	}
 
+	// Its push declaration and priority are the world entity's, so set those first.
 	void add_entity(uint64_t key, uint32_t net_id, std::vector<Val> vals) {
-		world.ents[key].vals = vals;
-		server.add_entity(key, net_id);
+		WorldEnt &w = world.ents[key];
+		w.vals = vals;
+		EntityLayout l;
+		l.slots = (int)vals.size();
+		l.push = w.push;
+		l.priority = w.priority;
+		l.stepped.assign(l.slots, 1);
+		l.kinds_check = 7;
+		server.add_entity(key, net_id, l);
 		for (auto &kv : peers) {
 			kv.second.slot_count[net_id] = (int)vals.size();
 		}
@@ -208,6 +240,7 @@ struct Net {
 				}
 				TestClientHost ch{ &p };
 				const Client<Val>::ApplyInfo info = p.client.apply(pkt.data(), pkt.size(), ch, now);
+				p.statuses.push_back(info.status);
 				if (info.ack) {
 					p.acks.push_back(info.ack);
 				}
@@ -223,7 +256,7 @@ struct Net {
 	}
 
 	// The client's next uplink packet, now, delivered whatever drop_acks says.
-	bool send_uplink(Peer &p) {
+	Result send_uplink(Peer &p) {
 		Writer w;
 		p.client.write_uplink(now, w);
 		return server.receive_uplink(p.id, w.data(), w.size(), uplink_host, now);
@@ -265,6 +298,7 @@ static void test_baseline_then_delta() {
 	n.add_entity(10, 100, { 1, 2, 3 });
 	n.tick();
 	CHECK(p.vals[100] == (std::vector<Val>{ 1, 2, 3 }));
+	CHECK(p.statuses == std::vector<Status>{ STATUS_OK });
 	CHECK(base_seq_of(n.last_packet(2)) == 0); // first send is a full frame
 	size_t full = n.last_packet(2).size();
 
@@ -356,6 +390,7 @@ static void test_unknown_baseline_is_dropped() {
 	n.drop_acks.insert(2);
 	n.tick();
 	CHECK(p.vals[100][0] == 1); // dropped, not misapplied
+	CHECK(p.statuses.back() == STATUS_NO_BASELINE);
 	printf("  delta against an unknown baseline is dropped: ok\n");
 }
 
@@ -368,7 +403,7 @@ static void test_reordered_snapshot_is_dropped() {
 	n.world.ents[10].vals[0] = 2;
 	n.tick();
 	TestClientHost ch{ &p };
-	p.client.apply(old_pkt.data(), old_pkt.size(), ch, n.now);
+	CHECK(p.client.apply(old_pkt.data(), old_pkt.size(), ch, n.now).status == STATUS_STALE);
 	CHECK(p.vals[100][0] == 2);
 	printf("  reordered snapshot is dropped: ok\n");
 }
@@ -386,6 +421,7 @@ static void test_truncated_packet_not_committed() {
 	Client<Val>::ApplyInfo info = p.client.apply(pkt.data(), pkt.size() - 1, ch, n.now);
 	CHECK(!info.committed);
 	CHECK(info.ack == 0);
+	CHECK(info.status == STATUS_MALFORMED);
 	printf("  truncated packet is not committed or acked: ok\n");
 }
 
@@ -393,8 +429,11 @@ static void test_protocol_mismatch_warns_once() {
 	Peer p;
 	uint8_t bad[] = { (uint8_t)(WIRE_VERSION + 1), 0, 0, 0, 0 };
 	TestClientHost ch{ &p };
-	CHECK(p.client.apply(bad, sizeof(bad), ch, 0).ack == 0);
+	const Client<Val>::ApplyInfo info = p.client.apply(bad, sizeof(bad), ch, 0);
+	CHECK(info.ack == 0 && info.status == STATUS_MISMATCH);
 	p.client.apply(bad, sizeof(bad), ch, 0);
+	CHECK(p.mismatches == 1);
+	CHECK(p.client.apply(bad, 0, ch, 0).status == STATUS_MALFORMED); // empty: no version to mismatch
 	CHECK(p.mismatches == 1);
 	CHECK(!p.client.uplink_due(0));
 	printf("  protocol mismatch warns once: ok\n");
@@ -485,6 +524,7 @@ static void test_refused_spawn_holds_ack() {
 		n.tick();
 	}
 	CHECK(a.spawned == std::vector<uint32_t>{ 500 });
+	CHECK(a.statuses.front() == STATUS_HELD && a.statuses.back() == STATUS_OK);
 	n.tick();
 	n.tick();
 	CHECK(a.spawned.size() == 1);
@@ -734,10 +774,10 @@ static void test_budget_overflow_drains_by_priority() {
 	Net n;
 	Peer &p = n.add_peer(2);
 	const int count = 400; // 7 bytes each, so a packet carries well under half of them
+	n.world.ents[10 + count - 1].priority = 50.0f;
 	for (int i = 0; i < count; i++) {
 		n.add_entity(10 + i, 100 + i, { 0 });
 	}
-	n.world.ents[10 + count - 1].priority = 50.0f;
 	for (int i = 0; i < 10; i++) {
 		n.tick(); // the first full baseline overflows too; let it drain
 	}
@@ -913,10 +953,57 @@ static void test_removed_entity_leaves_client_frame() {
 	n.server.remove_entity(10);
 	n.world.ents.erase(10);
 	p.slot_count.erase(100);
+	p.client.forget(100);
 	n.add_entity(11, 101, { 2 });
 	n.tick();
 	CHECK(p.vals[101][0] == 2);
 	printf("  removed entity is pruned and the stream continues: ok\n");
+}
+
+// An entity the host does away with and makes again at the same id, while the server goes on
+// replicating it: once forgotten, its next delta has no base to apply to, so the client holds the ack
+// and the delta isn't applied to the new one, which never had the slot it doesn't carry.
+static void test_forgotten_entity_takes_no_delta() {
+	Net n;
+	Peer &p = n.add_peer(2);
+	n.add_entity(10, 100, { 1, 2 });
+	n.tick();
+	p.client.forget(100);
+	p.vals[100] = { 0, 0 }; // the host's new one
+	n.world.ents[10].vals[0] = 5;
+	n.tick();
+	CHECK(p.statuses.back() == STATUS_HELD);
+	CHECK((p.vals[100] == std::vector<Val>{ 0, 0 }));
+	printf("  a forgotten entity takes no delta: ok\n");
+}
+
+// A despawn drops the spawn's entity from the client's frames with no word from the host, so an id
+// spawned again takes its first delta only after it arrives whole.
+static void test_despawn_drops_the_entity() {
+	Net n;
+	Peer &a = n.add_peer(2);
+	n.add_entity(500, 500, { 1, 2 });
+	a.slot_count.erase(500);
+	a.creates[500] = { 500, 2 };
+	n.server.add_spawn(500, TestServer::SpawnRecord());
+	n.tick();
+	CHECK(a.spawned == std::vector<uint32_t>{ 500 });
+	CHECK((a.vals[500] == std::vector<Val>{ 1, 2 }));
+	n.server.remove_entity(500);
+	n.server.despawn(500);
+	n.world.ents.erase(500);
+	for (int i = 0; i < 4; i++) {
+		n.tick();
+	}
+	CHECK(a.despawned == std::vector<uint32_t>{ 500 });
+	n.add_entity(500, 500, { 7, 8 });
+	n.server.add_spawn(500, TestServer::SpawnRecord());
+	a.vals.erase(500);
+	for (int i = 0; i < 4; i++) {
+		n.tick();
+	}
+	CHECK((a.vals[500] == std::vector<Val>{ 7, 8 }));
+	printf("  a despawn drops the entity from the client's frames: ok\n");
 }
 
 // GoldSrc rate / choke: a rated peer's snapshot bytes stay within its rate, it still converges, and
@@ -1198,7 +1285,7 @@ static void test_only_added_peers_are_served() {
 	CHECK(!n.server.has_peer(2) && n.server.peers().empty());
 	const uint8_t cmd[1] = { 7 };
 	a.client.push_command(1, cmd, sizeof(cmd), n.now);
-	CHECK(!n.send_uplink(a)); // a late packet from it goes nowhere
+	CHECK(n.send_uplink(a).status == STATUS_UNKNOWN_PEER); // a late packet from it goes nowhere
 	CHECK(n.uplink_host.commands.empty());
 	CHECK(!n.server.queue_reliable(2, cmd, 1) && !n.server.queue_unreliable(2, cmd, 1));
 	CHECK(!n.server.has_peer(2) && n.server.peer_stats(2).messages_queued == 0);
@@ -1212,6 +1299,50 @@ static void test_only_added_peers_are_served() {
 	n.tick();
 	CHECK(n.sent_to(2) == 1 && base_seq_of(n.last_packet(2)) == 0);
 	printf("  only the peers added are served, and a removed one stays removed: ok\n");
+}
+
+// A host derived from ServerHost or ClientHost defines only what its game uses: here no visibility,
+// spawns, messages or command_schema. A stream the server was given with set_command_schema is read
+// by it, and one set on neither end is a byte string on both.
+static void test_default_hosts() {
+	TestServer server;
+	MinimalServerHost sh;
+	sh.server = &server;
+	sh.vals = { 4, 5 };
+	server.add_peer(2);
+	EntityLayout layout;
+	layout.slots = 2;
+	server.add_entity(10, 100, layout);
+	const Schema schema{ FIELD_INT, FIELD_BOOL };
+	server.set_command_schema(9, schema);
+	Client<Val> client;
+	client.set_command_schema(9, schema);
+	MinimalClientHost ch;
+	ch.vals.resize(2);
+
+	server.tick(1000, sh);
+	CHECK(sh.sent.size() == 1);
+	CHECK(client.apply(sh.sent.back().data(), sh.sent.back().size(), ch, 1000).status == STATUS_OK);
+	CHECK((ch.vals == std::vector<Val>{ 4, 5 }));
+
+	Command cmd(2);
+	cmd[0].i = -3;
+	cmd[1].i = 1;
+	client.push_command(9, cmd, 1000);
+	const uint8_t bytes[2] = { 7, 8 };
+	client.push_command(4, bytes, sizeof(bytes), 1000);
+	Writer w;
+	client.write_uplink(1000, w);
+	CHECK(server.receive_uplink(2, w.data(), w.size(), sh, 1000));
+	CHECK(sh.commands.size() == 2 && sh.commands[0][0].i == -3 && sh.commands[0][1].i == 1);
+	CHECK(sh.commands.size() == 2 && sh.commands[1][0].bytes == std::vector<uint8_t>(bytes, bytes + 2));
+
+	sh.vals[1] = 6;
+	server.tick(1016, sh);
+	CHECK(sh.sent.size() == 2 && base_seq_of(sh.sent.back()) != 0); // a delta against the acked frame
+	CHECK(client.apply(sh.sent.back().data(), sh.sent.back().size(), ch, 1016).status == STATUS_OK);
+	CHECK((ch.vals == std::vector<Val>{ 4, 6 }));
+	printf("  hosts derived from ServerHost and ClientHost define only what they use: ok\n");
 }
 
 int main() {
@@ -1249,6 +1380,8 @@ int main() {
 	test_aged_history_goes_whole();
 	test_kinds_mismatch_refuses_entity();
 	test_removed_entity_leaves_client_frame();
+	test_forgotten_entity_takes_no_delta();
+	test_despawn_drops_the_entity();
 	test_rate_chokes_to_the_budget();
 	test_charged_traffic_delays_the_next_snapshot();
 	test_arrival_stats_count_only_real_loss();
@@ -1258,6 +1391,7 @@ int main() {
 	test_messages_ride_the_snapshot_in_order();
 	test_messages_survive_a_lost_snapshot();
 	test_only_added_peers_are_served();
+	test_default_hosts();
 	printf("%d checks passed\n", checks);
 	return 0;
 }

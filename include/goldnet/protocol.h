@@ -99,6 +99,23 @@ static const int COMMAND_BACKUP_DEFAULT = 2;
 // downlink's reliable sections. Past those it goes again only when overdue (see codec.h).
 static const int RELIABLE_BACKUP = 2;
 
+// What became of a packet handed to Client::apply (ApplyInfo::status) or Server::receive_uplink.
+enum Status : uint8_t {
+	STATUS_OK,           // taken: a snapshot committed and acked, an uplink packet read
+	STATUS_MALFORMED,    // truncated or corrupt
+	STATUS_MISMATCH,     // from a different build: another WIRE_VERSION
+	STATUS_UNKNOWN_PEER, // an uplink packet from a peer the server hasn't added
+	STATUS_STALE,        // a snapshot no newer than one already received
+	STATUS_NO_BASELINE,  // a snapshot against a frame this client no longer holds; it re-acks one it has
+	STATUS_HELD,         // a snapshot applied but not acked: a refused spawn or an entity not ready yet
+};
+
+// A Status that tests true when the packet was taken.
+struct Result {
+	Status status = STATUS_OK;
+	operator bool() const { return status == STATUS_OK; }
+};
+
 // Compact, self-delimiting wire encoding for per-slot values: a 1-byte tag, then the payload.
 // The DECODER needs no hint (it reads the tag and knows the width, so a value for an unknown
 // entity can still be consumed); only the SENDER chooses a lossy tag, from the slot's hint.

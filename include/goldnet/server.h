@@ -14,9 +14,15 @@
 // receive_uplink() and the netchan take only theirs. A packet from any other peer is dropped. Add
 // and remove peers between ticks, never from inside the host's callbacks.
 //
+// Entities. add_entity(key, net_id, layout) starts replicating one, and the layout says how its slots
+// go (EntityLayout); remove_entity(key) stops.
+//
+// The host. tick() and receive_uplink() call back into an object the game passes them, with the methods
+// listed below. Deriving it from ServerHost (at the end of this file) leaves only read, encode and send
+// to write; the rest default to a game that doesn't use them.
+//
 // The host passed to tick() provides:
 //   bool live(Entity &e)                        is the entity replicating this tick? (may refresh e.user)
-//   EntityLayout prepare(Entity &e)             first live tick: how its slots replicate (EntityLayout)
 //   void read(Entity &e, bool polled_only)      read the slot values, calling stamp() for each; when
 //                                               polled_only, skip the slots e.pushed() names
 //   bool visible(const Entity &e, int32_t peer) per-peer visibility of a live entity
@@ -37,8 +43,8 @@
 // ends) needs only add_entity. A runtime entity, which the client has no other way to know about,
 // is two registrations under one net_id, and the host makes both:
 //
-//   add_spawn(net_id, record)   tells each peer to create it; record.data is the host's recipe
-//   add_entity(key, net_id)     streams its slot state, like any other entity
+//   add_spawn(net_id, record)          tells each peer to create it; record.data is the host's recipe
+//   add_entity(key, net_id, layout)    streams its slot state, like any other entity
 //
 // and when it's destroyed, despawn(net_id) and remove_entity(key). Calling both on the same tick
 // is fine: a snapshot carries its spawns ahead of its entity deltas. A spawn reaches a peer the
@@ -50,11 +56,11 @@
 // and acking those must not leave the server believing it has them.
 //
 // On the client, Client::apply() hands each spawn to the host's spawn() before it reads the
-// deltas, so by the time spawn() returns, registered() and begin_entity() must know the entity.
-// A delta for an id the host doesn't know is discarded and the frame still acked, and an idle
-// entity's state is then never sent again. A host that can't create it yet returns false from
-// spawn(), and one that has it but can't take values yet sets begin_entity's r_defer; either way
-// the client withholds the ack and the server keeps offering it (Client::apply has the details).
+// deltas, so by the time spawn() returns, entity() must know the entity. A delta for an id the host
+// doesn't know is discarded and the frame still acked, and an idle entity's state is then never sent
+// again. A host that can't create it yet returns false from spawn(), and one that has it but can't
+// take values yet returns ENTITY_NOT_READY from entity(); either way the client withholds the ack and the
+// server keeps offering it (Client::apply has the details).
 //
 // The uplink. receive_uplink() takes each packet a peer sends: its commands and messages go to the
 // host, and the server takes the rest, the acks and what the client asks for. The host passed to it
@@ -84,8 +90,8 @@ namespace goldnet {
 
 struct NoUserData {};
 
-// How an entity's slots replicate, as the host's prepare() declares it on the entity's first live
-// tick. Fixed from then on.
+// How an entity's slots replicate, as add_entity takes it. Fixed for the entity's life; adding it
+// again replaces it.
 struct EntityLayout {
 	int slots = 0;
 	// Per slot: the host codes it against the peer's baseline value (encode's base), so the server
@@ -137,7 +143,6 @@ public:
 		// True when at least one slot is undeclared and so must be read on a tick where the entity
 		// was not marked. Entities that declare every slot skip the poll.
 		bool has_polled_ = true;
-		bool prepared_ = false;
 		// Change tracking, stamped ONCE per snapshot tick. The values an entity holds are the same
 		// for every peer, so "did slot s change" is answered once here rather than re-derived per
 		// peer. vals_ is the latest read; slot_ctr_[s] is the snapshot counter at which slot s last
@@ -168,7 +173,9 @@ public:
 
 	// --- Entities ---
 
-	Entity &add_entity(uint64_t p_key, uint32_t p_net_id) {
+	// Start replicating an entity: p_key is the host's identity for it, p_net_id its identity on the
+	// wire (the same on both ends), p_layout how its slots go. A key already added is replaced.
+	Entity &add_entity(uint64_t p_key, uint32_t p_net_id, EntityLayout p_layout) {
 		auto it = index_.find(p_key);
 		Entity *e;
 		if (it != index_.end()) {
@@ -180,6 +187,18 @@ public:
 		}
 		e->key_ = p_key;
 		e->net_id_ = p_net_id;
+		EntityLayout &l = e->layout_;
+		l = std::move(p_layout);
+		l.slots = std::max(l.slots, 0);
+		if (l.push.size() != (size_t)l.slots) {
+			l.push.clear(); // a declaration that doesn't line up with the slots declares nothing
+		}
+		e->has_polled_ = l.push.empty() || std::find(l.push.begin(), l.push.end(), 0) != l.push.end();
+		e->vals_.assign(l.slots, V());
+		// Newer than any frame sent so far, so a peer that held an entity at this net_id before (a key
+		// added again) is sent every slot, even one that reads as the default.
+		e->slot_ctr_.assign(l.slots, ctr_ + 1);
+		e->history_.assign(l.slots, {});
 		return *e;
 	}
 
@@ -367,10 +386,15 @@ public:
 
 	// One uplink packet from p_peer: its commands and messages go to p_host, its snapshot and channel
 	// acks to this server, and the peer's next header gets the command ack, the uplink ack and the
-	// uplink report. The rate and update rate it asks for apply from here on. False if the packet was
-	// malformed, from a mismatched build, or from a peer not added (which is dropped untouched).
+	// uplink report. The rate and update rate it asks for apply from here on. False, with the reason,
+	// if the packet was malformed, from a mismatched build, or from a peer not added (which is
+	// dropped untouched).
 	template <class Host>
-	bool receive_uplink(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now);
+	Result receive_uplink(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now);
+
+	// A command stream's field kinds, as the client's Client::set_command_schema names them. The
+	// uplink reads a stream set here by it, and asks the host's command_schema() for any other.
+	void set_command_schema(uint32_t p_stream, const Schema &p_schema) { schemas_[p_stream] = p_schema; }
 
 	// --- Messages (netchan.h) ---
 
@@ -558,6 +582,7 @@ private:
 	std::unordered_map<int32_t, PeerRing> rings_;
 	std::vector<int32_t> peers_; // rings_'s keys, in the order add_peer() added them
 	CommandReceiver uplink_;
+	std::unordered_map<uint32_t, Schema> schemas_; // set_command_schema's
 	// Monotonic snapshot counter, bumped once per tick that sends anything. It stamps
 	// Entity::slot_ctr_ and PeerRing::frame_ctr so change tests are a single integer compare. Unlike
 	// the 16-bit wire seq it never wraps in any realistic session (2^32 ticks at 60 Hz is ~2 years).
@@ -595,11 +620,11 @@ private:
 
 template <class V, class X>
 template <class Host>
-bool Server<V, X>::receive_uplink(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host,
+Result Server<V, X>::receive_uplink(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host,
 		uint32_t p_now) {
 	auto rit = rings_.find(p_peer);
 	if (rit == rings_.end()) {
-		return false;
+		return { STATUS_UNKNOWN_PEER };
 	}
 	struct Router {
 		Server &server;
@@ -608,12 +633,15 @@ bool Server<V, X>::receive_uplink(int32_t p_peer, const uint8_t *p_data, size_t 
 		void protocol_mismatch(int32_t p) { host.protocol_mismatch(p); }
 		void snapshot_ack(int32_t p, uint16_t seq) { server.on_ack(p, seq, now); }
 		void channel_ack(int32_t p, const ChannelAck &a) { server.on_channel_ack(p, a); }
-		const Schema *command_schema(int32_t p, uint32_t stream) { return host.command_schema(p, stream); }
+		const Schema *command_schema(int32_t p, uint32_t stream) {
+			auto it = server.schemas_.find(stream);
+			return it != server.schemas_.end() ? &it->second : host.command_schema(p, stream);
+		}
 		void command(int32_t p, uint32_t stream, const Command &c) { host.command(p, stream, c); }
 		void message(int32_t p, const uint8_t *d, size_t n, bool reliable) { host.message(p, d, n, reliable); }
 	};
 	Router router{ *this, p_host, p_now };
-	const bool ok = uplink_.receive(p_peer, p_data, p_size, router, p_now);
+	const Result res = uplink_.receive(p_peer, p_data, p_size, router, p_now);
 	PeerRing &pr = rit->second;
 	pr.cmd_ack = uplink_.ack(p_peer);
 	pr.cmd_news = pr.cmd_news || uplink_.take_news(p_peer);
@@ -623,7 +651,7 @@ bool Server<V, X>::receive_uplink(int32_t p_peer, const uint8_t *p_data, size_t 
 	const uint32_t rate = uplink_.rate(p_peer);
 	pr.rate_bps = rate > 0 && rate < MIN_RATE ? MIN_RATE : rate;
 	pr.update_rate_asked = uplink_.update_rate(p_peer);
-	return ok;
+	return res;
 }
 
 template <class V, class X>
@@ -662,20 +690,6 @@ void Server<V, X>::tick(uint32_t p_now, Host &p_host) {
 		Entity &e = ents_[i];
 		if (!p_host.live(e)) {
 			continue;
-		}
-		if (!e.prepared_) {
-			EntityLayout &l = e.layout_;
-			l = p_host.prepare(e);
-			l.slots = std::max(l.slots, 0);
-			if (l.push.size() != (size_t)l.slots) {
-				l.push.clear(); // a declaration that doesn't line up with the slots declares nothing
-			}
-			e.has_polled_ = l.push.empty() || std::find(l.push.begin(), l.push.end(), 0) != l.push.end();
-			e.prepared_ = true;
-			e.dirty_ = true; // first sight: vals_ has nothing in it yet
-			e.vals_.assign(l.slots, V());
-			e.slot_ctr_.assign(l.slots, ctr_);
-			e.history_.assign(l.slots, {});
 		}
 		// A marked entity is read whole. A clean one keeps the values and stamps it already has for
 		// every slot it declared, which is all any peer — including one being sent a full baseline —
@@ -984,5 +998,36 @@ void Server<V, X>::tick(uint32_t p_now, Host &p_host) {
 		charge(peer, p_now, packet.size() + (size_t)packet_overhead_);
 	}
 }
+
+// A base for the host Server::tick and Server::receive_uplink call back into, one object for both:
+// derive from it and define read, encode and send, which it leaves pure. Everything else has
+// a default that suits a game not using the feature, so define only what you use, marked override
+// so a misspelt name fails to compile rather than quietly keeping the default. A host needn't derive
+// from it at all: the server calls whatever the object it's handed has, and this only supplies the rest.
+template <class V, class X = NoUserData>
+struct ServerHost {
+	typedef typename Server<V, X>::Entity Entity;
+
+	virtual ~ServerHost() = default;
+
+	virtual void read(Entity &e, bool polled_only) = 0;
+	virtual void encode(Writer &w, const Entity &e, int slot, const V *base, uint32_t now_ms) = 0;
+	virtual void send(int32_t peer, const Writer &packet) = 0;
+
+	// Every entity added replicates, to every peer.
+	virtual bool live(Entity &) { return true; }
+	virtual bool visible(const Entity &, int32_t) { return true; }
+	virtual bool spawn_visible(uint64_t, int32_t) { return true; }
+
+	// The uplink: no commands or messages taken, and a stream with no schema set on the server
+	// (Server::set_command_schema) is one FIELD_BYTES field, as it is on the client.
+	virtual void protocol_mismatch(int32_t) {}
+	virtual const Schema *command_schema(int32_t, uint32_t) {
+		static const Schema bytes_only{ FIELD_BYTES };
+		return &bytes_only;
+	}
+	virtual void command(int32_t, uint32_t, const Command &) {}
+	virtual void message(int32_t, const uint8_t *, size_t, bool) {}
+};
 
 } // namespace goldnet
