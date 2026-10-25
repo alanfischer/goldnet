@@ -33,6 +33,7 @@ struct WorldEnt {
 struct World {
 	std::map<uint64_t, WorldEnt> ents;
 	std::map<int32_t, std::vector<std::vector<uint8_t>>> outbox; // peer -> packets sent this tick
+	std::map<uint32_t, uint64_t> key_of;                         // net_id -> its key in ents
 	int reads = 0;
 
 	bool is_visible(uint64_t key, int32_t peer) const {
@@ -48,10 +49,11 @@ struct TestServerHost {
 	World *world;
 	TestServer *server;
 
-	bool live(TestServer::Entity &e) { return world->ents.count(e.key()) > 0; }
+	uint64_t key(const TestServer::Entity &e) const { return world->key_of.at(e.net_id()); }
+	bool live(TestServer::Entity &e) { return world->ents.count(key(e)) > 0; }
 	void read(TestServer::Entity &e, bool polled_only) {
 		world->reads++;
-		const WorldEnt &w = world->ents[e.key()];
+		const WorldEnt &w = world->ents[key(e)];
 		for (int s = 0; s < e.slots(); s++) {
 			if (polled_only && e.pushed(s)) {
 				continue;
@@ -59,8 +61,8 @@ struct TestServerHost {
 			server->stamp(e, s, w.vals[s]);
 		}
 	}
-	bool visible(const TestServer::Entity &e, int32_t peer) { return world->is_visible(e.key(), peer); }
-	bool spawn_visible(uint64_t key, int32_t peer) { return world->is_visible(key, peer); }
+	bool visible(const TestServer::Entity &e, int32_t peer) { return world->is_visible(key(e), peer); }
+	bool spawn_visible(uint32_t net_id, int32_t peer) { return world->is_visible(world->key_of.at(net_id), peer); }
 	// An int as its step from the peer's baseline value, the way a host codes an int slot.
 	void encode(Writer &w, const TestServer::Entity &e, int slot, const Val *base, uint32_t) {
 		put_varint(&w, e.value(slot) - (base ? *base : 0));
@@ -117,6 +119,7 @@ struct Peer {
 	std::map<uint32_t, int> synced;           // net_id -> times `synchronized` fired
 	std::vector<uint32_t> spawned, despawned, lost;
 	std::vector<uint32_t> given_up; // ApplyInfo::given_up, every snapshot's
+	int wholes = 0;                 // entities that arrived whole
 	std::vector<uint16_t> acks;
 	std::vector<Status> statuses; // of every snapshot delivered, in order
 	std::vector<uint32_t> times;
@@ -163,6 +166,7 @@ struct TestClientHost {
 		if (p->not_ready.count(id)) {
 			return ENTITY_NOT_READY;
 		}
+		p->wholes += u.whole() ? 1 : 0;
 		std::vector<Val> &vals = p->vals[id];
 		vals.resize(p->slot_count[id]);
 		bool applied = false;
@@ -221,7 +225,8 @@ struct Net {
 		l.priority = w.priority;
 		l.stepped.assign(l.slots, 1);
 		l.kinds_check = 7;
-		server.add_entity(key, net_id, l);
+		world.key_of[net_id] = key;
+		server.add_entity(net_id, l);
 		for (auto &kv : peers) {
 			kv.second.slot_count[net_id] = (int)vals.size();
 		}
@@ -485,7 +490,7 @@ static void test_spawn_is_lazy_and_reliable() {
 	n.world.ents[10].visible_to = { 2 };
 	TestServer::SpawnRecord rec;
 	rec.spawner_net_id = 7;
-	rec.vis_keys = { 10 };
+	rec.entities = { 100 };
 	n.server.add_spawn(500, rec);
 
 	n.drop_snapshots.insert(2);
@@ -604,8 +609,8 @@ static void test_slots_past_max_are_dropped() {
 	n.world.ents[10].push.assign(vals.size(), 0);
 	n.world.ents[10].push[3] = 1; // lines up with the slots declared, so it holds for the ones kept
 	n.add_entity(10, 100, vals);
-	CHECK(n.server.find(10)->slots() == MAX_SLOTS);
-	CHECK(n.server.find(10)->pushed(3) && !n.server.find(10)->pushed(2));
+	CHECK(n.server.find(100)->slots() == MAX_SLOTS);
+	CHECK(n.server.find(100)->pushed(3) && !n.server.find(100)->pushed(2));
 	n.tick();
 	CHECK(a.vals[100].size() == vals.size());
 	for (int s = 0; s < MAX_SLOTS; s++) {
@@ -692,7 +697,7 @@ static void test_entity_sent_whole_until_its_spawn_is_proven() {
 	a.slot_count.erase(100);
 	a.creates[500] = { 100, 2 };
 	TestServer::SpawnRecord rec;
-	rec.vis_keys = { 10 };
+	rec.entities = { 100 };
 	n.server.add_spawn(500, rec);
 	n.drop_snapshots.insert(2);
 	for (int i = 0; i <= RELIABLE_BACKUP; i++) {
@@ -710,7 +715,7 @@ static void test_entity_sent_whole_until_its_spawn_is_proven() {
 	printf("  an entity goes whole until its spawn is proven: ok\n");
 }
 
-// The same with no vis_keys, as a host whose spawns everyone sees makes them: the entity at the
+// The same with no entities named, as a host whose spawns everyone sees makes them: the entity at the
 // spawn's own net_id is the spawn's.
 static void test_entity_at_the_spawns_id_waits_for_it() {
 	Net n;
@@ -791,7 +796,7 @@ static void test_second_despawn_keeps_the_first_owed() {
 	Peer &b = n.add_peer(3);
 	n.add_entity(10, 100, { 1 });
 	TestServer::SpawnRecord rec;
-	rec.vis_keys = { 10 };
+	rec.entities = { 100 };
 	n.server.add_spawn(500, rec);
 	n.tick();
 	n.tick();
@@ -902,6 +907,200 @@ static void test_budget_overflow_drains_by_priority() {
 	printf("  budget overflow drains, highest priority first: ok\n");
 }
 
+// Leaves are on by default, as GoldSrc always told a client what left its PVS. Turned off, a leave
+// sends nothing and the client keeps the entity as it was.
+static void test_relevance_events_on_by_default() {
+	Net n;
+	Peer &p = n.add_peer(2);
+	n.add_entity(10, 100, { 4 });
+	n.tick();
+	n.tick();
+	n.world.ents[10].hidden = true;
+	n.tick();
+	CHECK(n.server.relevance_events() && p.lost == std::vector<uint32_t>{ 100 });
+
+	Net m;
+	m.server.set_relevance_events(false);
+	Peer &q = m.add_peer(2);
+	m.add_entity(10, 100, { 4 });
+	m.tick();
+	m.tick();
+	m.world.ents[10].hidden = true;
+	m.world.ents[10].vals[0] = 5;
+	m.tick();
+	m.tick();
+	CHECK(q.lost.empty() && q.vals[100][0] == 4);
+	printf("  leaves are sent by default, and not when turned off: ok\n");
+}
+
+// Each end says how long the other has been quiet, counting from when it started listening.
+static void test_silent_ms() {
+	Net n;
+	Peer &p = n.add_peer(2);
+	n.add_entity(10, 100, { 1 });
+	CHECK(n.server.silent_ms(2, n.now) == 0 && n.server.silent_ms(9, n.now) == 0); // not served yet, not added
+	CHECK(p.client.silent_ms(n.now) == 0);
+	n.drop_acks.insert(2);
+	n.tick(); // first served now
+	n.tick();
+	n.tick();
+	CHECK(n.server.silent_ms(2, n.now) == 32);
+	CHECK(p.client.silent_ms(n.now) == 0); // its snapshots arrive
+	n.drop_acks.clear();
+	n.tick();
+	CHECK(n.server.silent_ms(2, n.now) == 0);
+	n.drop_snapshots.insert(2);
+	n.tick();
+	n.tick();
+	CHECK(p.client.silent_ms(n.now) == 32);
+	CHECK(n.server.silent_ms(2, n.now) == 32); // with no snapshots it sends nothing either
+
+	Client<Val> c; // before any snapshot, quiet since its first uplink packet
+	Writer w;
+	c.write_uplink(w, 100);
+	CHECK(c.silent_ms(150) == 50);
+	printf("  each end times the other's silence: ok\n");
+}
+
+// An entity whose stepped slot has outrun its history against the peer's baseline goes whole, and
+// whole is every slot: one left out would come back as the client's default. A peer on a slower
+// update rate, beside one served every tick, is how a baseline still in the ring falls behind a
+// slot's history.
+static void test_whole_entity_carries_every_slot() {
+	Net n;
+	n.server.set_snapshot_rate(60);
+	Peer &p = n.add_peer(2);
+	n.add_peer(3); // read every tick for this one, so slot 0 changes every tick
+	p.client.set_update_rate(15); // every 4th tick
+	n.add_entity(10, 100, { 1, 5 });
+	for (int i = 0; i < 12; i++) {
+		n.tick();
+	}
+	CHECK(n.server.peer_stats(2).update_rate == 15);
+	n.drop_acks.insert(2); // the baseline stays put while slot 0 runs through its history
+	const int ticks = SLOT_HISTORY + 8;
+	for (int i = 0; i < ticks; i++) {
+		n.world.ents[10].vals[0]++;
+		n.tick();
+	}
+	n.drop_acks.clear();
+	for (int i = 0; i < 12; i++) {
+		n.tick();
+	}
+	CHECK((p.vals[100] == std::vector<Val>{ 1 + ticks, 5 }));
+	n.world.ents[10].vals[1] = 6; // a change from the 5 the client must still hold
+	for (int i = 0; i < 8; i++) {
+		n.tick();
+	}
+	CHECK((p.vals[100] == std::vector<Val>{ 1 + ticks, 6 }));
+	printf("  a whole entity carries every slot: ok\n");
+}
+
+// A slot's first change from where it started is a change from V(), not a reason to go whole.
+static void test_first_change_from_default_is_a_delta() {
+	Net n;
+	Peer &p = n.add_peer(2);
+	n.add_entity(10, 100, { 3, 0 });
+	n.tick();
+	n.tick();
+	const int wholes = p.wholes;
+	n.world.ents[10].vals[1] = 9;
+	n.tick();
+	CHECK(p.wholes == wholes && (p.vals[100] == std::vector<Val>{ 3, 9 }));
+	printf("  a slot's first change from its start is a delta: ok\n");
+}
+
+// More leaves than a snapshot carries keeps the rest in the frame, as the peer still holds them, but
+// at the values it last had: one that changed meanwhile and comes back before its leave goes must
+// come back whole, not as no change at all.
+static void test_carried_leave_reenters_whole() {
+	Net n;
+	Peer &p = n.add_peer(2);
+	const int count = MAX_LEAVES_PER_SNAPSHOT + 8;
+	for (int i = 0; i < count; i++) {
+		n.add_entity(10 + i, 100 + i, { 0 });
+	}
+	n.tick();
+	n.tick();
+	for (int i = 0; i < count; i++) {
+		n.world.ents[10 + i].hidden = true;
+	}
+	n.world.ents[10 + count - 1].vals[0] = 7; // its leave is one held back by the cap
+	n.tick();
+	CHECK(p.lost.size() == (size_t)MAX_LEAVES_PER_SNAPSHOT);
+	n.world.ents[10 + count - 1].hidden = false;
+	n.tick();
+	n.tick();
+	CHECK(p.vals[100 + count - 1][0] == 7);
+	printf("  a leave held back by the cap re-enters whole: ok\n");
+}
+
+// Many entities, registered out of net_id order, under loss, PVS churn, a byte budget and a leave
+// cap that both overflow: once the link is clean and the world still, every peer holds every
+// visible entity's latest value.
+static void test_soak_converges() {
+	Net n;
+	Peer &a = n.add_peer(2);
+	Peer &b = n.add_peer(3);
+	const int count = 300;
+	for (int i = 0; i < count; i++) {
+		n.world.ents[10 + i].priority = 1.0f + (float)(i % 3);
+		n.add_entity(10 + i, 1000 + (uint32_t)(i * 7 % count), { 0, 0 });
+	}
+	uint32_t rng = sim_rng_seed(12345);
+	auto roll = [&](int p_n) { return (int)(xorshift32(rng) % (uint32_t)p_n); };
+	for (int t = 0; t < 600; t++) {
+		for (int k = 0; k < 40; k++) {
+			n.world.ents[10 + roll(count)].vals[roll(2)] = roll(1000) - 500;
+		}
+		for (int k = 0; k < 4; k++) {
+			WorldEnt &w = n.world.ents[10 + roll(count)];
+			const int how = roll(4);
+			w.hidden = how == 0;
+			w.visible_to.clear();
+			if (how == 1) {
+				w.visible_to.insert(2);
+			} else if (how == 2) {
+				w.visible_to.insert(3);
+			}
+		}
+		if (t % 150 == 75) {
+			for (int k = 0; k < 100; k++) {
+				n.world.ents[10 + k + (t % 2) * 100].hidden = true; // more leaves than a snapshot carries
+			}
+		}
+		n.drop_snapshots.clear();
+		n.drop_acks.clear();
+		for (int32_t peer : { 2, 3 }) {
+			if (roll(10) < 3) {
+				n.drop_snapshots.insert(peer);
+			}
+			if (roll(10) < 3) {
+				n.drop_acks.insert(peer);
+			}
+		}
+		n.tick();
+	}
+	n.drop_snapshots.clear();
+	n.drop_acks.clear();
+	for (int t = 0; t < 100; t++) {
+		n.tick();
+	}
+	int checked = 0;
+	for (Peer *p : { &a, &b }) {
+		for (int i = 0; i < count; i++) {
+			if (!n.world.is_visible(10 + i, p->id)) {
+				continue;
+			}
+			const uint32_t id = 1000 + (uint32_t)(i * 7 % count);
+			CHECK(p->vals[id] == n.world.ents[10 + i].vals);
+			checked++;
+		}
+	}
+	CHECK(checked > count / 2);
+	printf("  a long lossy session with PVS churn converges (%d entities checked): ok\n", checked);
+}
+
 static void test_update_rate_throttles_one_peer() {
 	Net n;
 	Peer &fast = n.add_peer(2);
@@ -965,7 +1164,7 @@ static void test_push_declared_slots_skip_reads() {
 	n.tick();
 	CHECK(n.world.reads == reads); // fully declared and unmarked: not read
 	CHECK(p.vals[100][0] == 1);
-	n.server.mark_dirty(10);
+	n.server.mark_dirty(100);
 	n.tick();
 	CHECK(p.vals[100][0] == 2);
 	printf("  push-declared slots skip reads until marked: ok\n");
@@ -996,17 +1195,17 @@ static void test_slots_go_as_changes() {
 	n.add_entity(10, 100, { 1000000, 5 });
 	n.tick();
 	n.world.ents[10].vals[0] = 1000001;
-	n.server.mark_dirty(10);
+	n.server.mark_dirty(100);
 	n.tick();
 	CHECK(p.vals[100][0] == 1000001);
 	// net_id 4, head 1, length 1, and a step of +1 in one byte.
 	CHECK(entity_bytes(n.last_packet(2)) == 7);
 	n.drop_acks.insert(2); // the peer's baseline stays put while the slot moves and returns
 	n.world.ents[10].vals[1] = 6;
-	n.server.mark_dirty(10);
+	n.server.mark_dirty(100);
 	n.tick();
 	n.world.ents[10].vals[1] = 5;
-	n.server.mark_dirty(10);
+	n.server.mark_dirty(100);
 	n.tick();
 	n.drop_acks.clear();
 	n.tick();
@@ -1023,13 +1222,13 @@ static void test_aged_history_goes_whole() {
 	n.drop_acks.insert(2);
 	for (int i = 1; i <= SLOT_HISTORY + 5; i++) {
 		n.world.ents[10].vals[0] = i * 1000;
-		n.server.mark_dirty(10);
+		n.server.mark_dirty(100);
 		n.tick();
 	}
 	n.drop_acks.clear();
 	n.drop_snapshots.insert(2);
 	n.world.ents[10].vals[0] = 7;
-	n.server.mark_dirty(10);
+	n.server.mark_dirty(100);
 	n.tick();
 	n.drop_snapshots.clear();
 	n.tick();
@@ -1056,7 +1255,7 @@ static void test_removed_entity_leaves_client_frame() {
 	Peer &p = n.add_peer(2);
 	n.add_entity(10, 100, { 1 });
 	n.tick();
-	n.server.remove_entity(10);
+	n.server.remove_entity(100);
 	n.world.ents.erase(10);
 	p.slot_count.erase(100);
 	p.client.forget(100);
@@ -1418,7 +1617,7 @@ static void test_default_hosts() {
 	server.add_peer(2);
 	EntityLayout layout;
 	layout.slots = 2;
-	server.add_entity(10, 100, layout);
+	server.add_entity(100, layout);
 	const Schema schema{ FIELD_INT, FIELD_BOOL };
 	server.set_command_schema(9, schema);
 	Client<Val> client;
@@ -1482,6 +1681,12 @@ int main() {
 	test_leave_lost_is_rederived();
 	test_reentry_before_leave_acked();
 	test_budget_overflow_drains_by_priority();
+	test_relevance_events_on_by_default();
+	test_silent_ms();
+	test_whole_entity_carries_every_slot();
+	test_first_change_from_default_is_a_delta();
+	test_carried_leave_reenters_whole();
+	test_soak_converges();
 	test_update_rate_throttles_one_peer();
 	test_update_rate_grant();
 	test_push_declared_slots_skip_reads();

@@ -149,8 +149,8 @@ struct ServerApp : ServerHost<Value> {
 	int fd = -1;
 	DemoServer server;
 	NetSim<Outgoing> sim;
-	std::map<uint64_t, Ball> balls; // key == net_id
-	std::vector<uint64_t> spawn_order;
+	std::map<uint32_t, Ball> balls; // by net_id
+	std::vector<uint32_t> spawn_order;
 	int64_t total_bounces = 0;
 	uint32_t next_net_id = 100;
 	char next_letter = 'A';
@@ -172,12 +172,12 @@ struct ServerApp : ServerHost<Value> {
 	// Everything is visible to everyone, and the one command stream is a byte string, so the
 	// defaults cover the rest.
 	void read(DemoServer::Entity &e, bool) override {
-		if (e.key() == SCOREBOARD_ID) {
+		if (e.net_id() == SCOREBOARD_ID) {
 			server.stamp(e, 0, Value((int64_t)balls.size()));
 			server.stamp(e, 1, Value(total_bounces));
 			return;
 		}
-		const Ball &b = balls[e.key()];
+		const Ball &b = balls[e.net_id()];
 		server.stamp(e, 0, Value(b.x));
 		server.stamp(e, 1, Value(b.y));
 		server.stamp(e, 2, Value(atan2f(b.vy, b.vx)));
@@ -185,7 +185,7 @@ struct ServerApp : ServerHost<Value> {
 	}
 	// Every value whole and self-tagged: simple, and right against any base.
 	void encode(Writer &w, const DemoServer::Entity &e, int slot, const Value *, uint32_t now) override {
-		encode_value(w, e.value(slot), e.key() == SCOREBOARD_ID ? QUANT_AUTO : BALL_QUANT[slot], now);
+		encode_value(w, e.value(slot), e.net_id() == SCOREBOARD_ID ? QUANT_AUTO : BALL_QUANT[slot], now);
 	}
 	void send(int32_t peer, const Writer &packet) override {
 		Outgoing o{ peers[peer].addr, std::vector<uint8_t>(packet.data(), packet.data() + packet.size()) };
@@ -238,15 +238,15 @@ struct ServerApp : ServerHost<Value> {
 		server.add_spawn(id, rec);
 		EntityLayout l;
 		l.slots = BALL_SLOTS;
-		server.add_entity(id, id, l);
+		server.add_entity(id, l);
 	}
 
 	void despawn_oldest() {
-		const uint64_t id = spawn_order.front();
+		const uint32_t id = spawn_order.front();
 		spawn_order.erase(spawn_order.begin());
 		balls.erase(id);
 		server.remove_entity(id);
-		server.despawn((uint32_t)id);
+		server.despawn(id);
 	}
 
 	void simulate(float dt) {
@@ -307,7 +307,7 @@ struct ServerApp : ServerHost<Value> {
 		server.set_packet_overhead(28); // IPv4 + UDP headers
 		EntityLayout scoreboard;
 		scoreboard.slots = 2; // live balls, total bounces
-		server.add_entity(SCOREBOARD_ID, SCOREBOARD_ID, scoreboard);
+		server.add_entity(SCOREBOARD_ID, scoreboard);
 		printf("[server] listening on udp %d (loss %d%%, latency %d ms)\n", port, sim.loss_percent(),
 				sim.latency_max_ms());
 

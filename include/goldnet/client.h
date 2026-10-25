@@ -229,6 +229,7 @@ public:
 	void reset() {
 		arrivals_ = Arrivals();
 		arrived_last_ = 0;
+		heard_ = false;
 		for (int i = 0; i < RING; i++) {
 			frames_[i].clear();
 			frame_seq_[i] = 0;
@@ -249,6 +250,10 @@ public:
 		update_rate_granted_ = -1;
 		apply_link();
 	}
+
+	// How long since a snapshot last arrived, ms, or since the first uplink packet went if none has:
+	// what a host times a quiet server out on (GoldSrc's cl_timeout). 0 before either.
+	uint32_t silent_ms(uint32_t p_now) const { return heard_ ? p_now - heard_ms_ : 0; }
 
 	// p_now: the host's clock, the same one it writes its uplink packets by.
 	template <class Host>
@@ -329,6 +334,10 @@ public:
 
 	// Build the next uplink packet.
 	void write_uplink(Writer &r_out, uint32_t p_now) {
+		if (!heard_) {
+			heard_ = true; // silent_ms counts from the first packet out until the first one in
+			heard_ms_ = p_now;
+		}
 		uplink_.write(r_out, ack_, chan_.ack_source(), p_now);
 		news_ = false;
 	}
@@ -358,6 +367,8 @@ private:
 	};
 	Arrivals arrivals_;
 	uint16_t arrived_last_ = 0; // the newest seq seen; 0 = none yet
+	uint32_t heard_ms_ = 0;     // see silent_ms
+	bool heard_ = false;
 	ChannelReceiver chan_;
 	CommandSender uplink_;
 	uint16_t ack_ = 0;    // the snapshot ack the next uplink packet carries; 0 = none
@@ -437,6 +448,8 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 		return info;
 	}
 	count_arrival(seq);
+	heard_ = true;
+	heard_ms_ = p_now;
 
 	// Drop stale/reordered snapshots (unreliable transport). We only advance forward. A snapshot
 	// newer than the last committed one but not the last received is stale too: GoldSrc drops any
