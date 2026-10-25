@@ -43,7 +43,7 @@
 //             uvarint mask (bit i: field i differs from the base), then each changed field's
 //             change in field order (FieldKind)
 //
-// A client's Client owns its CommandSender (Client::uplink) and a server's Server owns its
+// A client's Client owns its CommandSender (Client::push_command & co) and a server's Server owns its
 // CommandReceiver (Server::receive_uplink), and each passes the acks between the two directions
 // itself. Used on their own, the host passed to receive() provides:
 //   void protocol_mismatch(int32_t peer)            a different build is talking to us (once per peer)
@@ -205,8 +205,9 @@ inline bool get_command(Reader &r, const Schema &p_schema, const Command *p_base
 	return !r.failed();
 }
 
-// The client end. Client::uplink() is the one a client uses; Client drives on_ack, on_channel_ack
-// and write itself, and sets the rate, update rate and interval from its own (Client::set_rate & co).
+// The client end. A Client keeps one and forwards a host's commands and messages to it; it drives
+// on_ack, on_channel_ack and write itself, and sets the rate, update rate and interval from its own
+// (Client::set_rate & co).
 class CommandSender {
 public:
 	// A stream's field kinds, in order; the server's host must name the same. A stream with none set

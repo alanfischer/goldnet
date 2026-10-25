@@ -5,7 +5,7 @@
 // ack. Engine-agnostic, like Server.
 //
 // The uplink. Everything the client sends rides its uplink packets: its commands and messages
-// (uplink(), see uplink.h), the snapshot ack, what it has of the server's channel, and the rate and
+// (push_command and queue_reliable / queue_unreliable, see uplink.h), the snapshot ack, what it has of the server's channel, and the rate and
 // update rate it asks for (set_rate, set_update_rate). Send one whenever uplink_due() says so:
 //
 //   if (client.uplink_due(now)) { Writer w; client.write_uplink(now, w); /* send w */ }
@@ -70,18 +70,60 @@ public:
 		uint16_t command_ack = 0; // the header's: the newest command the server has; 0 = none
 	};
 
-	// Snapshots that arrived, and seqs skipped on the way to them, this session. The server
-	// spends a seq only on a snapshot it sends, so a skipped one was lost (or is late, and is taken
-	// back off when it lands). Counted before any check that could still drop the snapshot.
-	struct ArrivalStats {
-		uint32_t received = 0;
-		uint32_t lost = 0;
+	// The link, as this end sees it. Totals are this session's.
+	struct Stats {
+		// Snapshots that arrived, and seqs skipped on the way to them. The server spends a seq only
+		// on a snapshot it sends, so a skipped one was lost (or is late, and is taken back off when
+		// it lands). Counted before any check that could still drop the snapshot.
+		uint32_t snapshots_received = 0;
+		uint32_t snapshots_lost = 0;
+		// How far behind its best the downlink arrives, ms, and what it delivers, bytes/sec on the wire.
+		uint32_t downlink_lag_ms = 0;
+		double delivered_bps = 0.0;
+		// The snapshots/sec the server granted, from its last header; -1 = no word yet.
+		int update_rate_granted = -1;
+		// What the uplink goes by now, the setting or the automatic pick: the rate asked of the
+		// server, bytes/sec (0 = no limit), and the gap between command packets, ms (0 = whenever
+		// there is something to send).
+		uint32_t rate = 0;
+		uint32_t command_interval_ms = 0;
+		// The server's last report of our uplink: how far behind its best it arrives, ms, and its
+		// packets arriving per second.
+		uint32_t uplink_lag_ms = 0;
+		uint32_t uplink_pps = 0;
+		// Commands not acked yet, ones given up on (they fell out of COMMAND_RING), and the round trip.
+		uint32_t commands_pending = 0;
+		uint32_t commands_dropped = 0;
+		uint32_t command_rtt_ms = 0;
+		// Reliable messages queued to the server, and how many of those it has. Both in queue order.
+		uint64_t messages_queued = 0;
+		uint64_t messages_delivered = 0;
+		// The server isn't taking our reliable data: GoldSrc dropped the connection.
+		bool overflowed = false;
 	};
-	const ArrivalStats &arrival_stats() const { return arrivals_; }
+	Stats stats() const {
+		Stats st;
+		st.snapshots_received = arrivals_.received;
+		st.snapshots_lost = arrivals_.lost;
+		st.downlink_lag_ms = downlink_.lag_ms();
+		st.delivered_bps = downlink_.delivered_bps();
+		st.update_rate_granted = update_rate_granted_;
+		st.rate = uplink_.rate();
+		st.command_interval_ms = uplink_.interval_ms();
+		st.uplink_lag_ms = uplink_lag_ms_;
+		st.uplink_pps = uplink_pps_;
+		st.commands_pending = (uint32_t)uplink_.pending();
+		st.commands_dropped = uplink_.dropped();
+		st.command_rtt_ms = uplink_.rtt_ms();
+		st.messages_queued = uplink_.reliable_queued();
+		st.messages_delivered = uplink_.reliable_delivered();
+		st.overflowed = uplink_.overflowed();
+		return st;
+	}
 
 	// A fresh session: old baselines are meaningless.
 	void reset() {
-		arrivals_ = ArrivalStats();
+		arrivals_ = Arrivals();
 		arrived_last_ = 0;
 		for (int i = 0; i < RING; i++) {
 			frames_[i].clear();
@@ -108,10 +150,24 @@ public:
 	template <class Host>
 	ApplyInfo apply(const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now);
 
-	// The commands and messages this client sends (uplink.h). Its rate, update rate and interval are
-	// set from the ones below.
-	CommandSender &uplink() { return uplink_; }
-	const CommandSender &uplink() const { return uplink_; }
+	// --- Commands and messages (uplink.h, netchan.h) ---
+
+	// A command stream's field kinds, in order; the server's host must name the same. A stream with
+	// none set is one FIELD_BYTES field. Set it before the stream's first command.
+	void set_command_schema(uint32_t p_stream, const Schema &p_schema) { uplink_.set_schema(p_stream, p_schema); }
+	const Schema &command_schema(uint32_t p_stream) const { return uplink_.schema(p_stream); }
+	// Queue one command, one field per schema entry (missing ones are zero, extra ones dropped), or
+	// one byte string for a stream with no schema set. Returns its seq.
+	uint16_t push_command(uint32_t p_stream, Command p_cmd, uint32_t p_now) {
+		return uplink_.push(p_stream, std::move(p_cmd), p_now);
+	}
+	uint16_t push_command(uint32_t p_stream, const uint8_t *p_data, size_t p_size, uint32_t p_now) {
+		return uplink_.push(p_stream, p_data, p_size, p_now);
+	}
+
+	void queue_reliable(const uint8_t *p_data, size_t p_size) { uplink_.queue_reliable(p_data, p_size); }
+	// False if the datagram is full and the message was dropped.
+	bool queue_unreliable(const uint8_t *p_data, size_t p_size) { return uplink_.queue_unreliable(p_data, p_size); }
 
 	// --- The link (GoldSrc rate, cl_updaterate, cl_cmdrate). Settings outlive reset(). ---
 
@@ -134,8 +190,6 @@ public:
 		apply_link();
 	}
 	uint32_t update_rate() const { return update_rate_; }
-	// What the server granted, from its last header; -1 = no word yet this session.
-	int update_rate_granted() const { return update_rate_granted_; }
 
 	// Uplink packets/sec; 0 = whenever there is something to send. While auto_command_rate is on,
 	// picked from the server's report of our uplink instead (CmdRateAuto), up to p_max_hz, the rate
@@ -155,14 +209,6 @@ public:
 	// Wire bytes each snapshot costs beyond its payload (headers below the protocol), for measuring
 	// what the downlink delivers.
 	void set_packet_overhead(int p_bytes) { packet_overhead_ = p_bytes > 0 ? p_bytes : 0; }
-
-	// How far behind its best the downlink arrives, ms, and what it delivers, bytes/sec on the wire.
-	uint32_t downlink_lag_ms() const { return downlink_.lag_ms(); }
-	double delivered_bps() const { return downlink_.delivered_bps(); }
-	// The server's last report of our uplink: how far behind its best it arrives, ms, and its packets
-	// arriving per second.
-	uint32_t uplink_lag_ms() const { return uplink_lag_ms_; }
-	uint32_t uplink_pps() const { return uplink_pps_; }
 
 	// Whether an uplink packet should go now: commands or messages due, or news the server is waiting on.
 	bool uplink_due(uint32_t p_now) const {
@@ -195,7 +241,11 @@ private:
 	// Consecutive frames deferred because a KNOWN entity wasn't ready yet. Capped so an entity that
 	// never resolves can't stall the stream forever; after the cap we accept the frame and move on.
 	uint32_t defer_streak_ = 0;
-	ArrivalStats arrivals_;
+	struct Arrivals {
+		uint32_t received = 0;
+		uint32_t lost = 0;
+	};
+	Arrivals arrivals_;
 	uint16_t arrived_last_ = 0; // the newest seq seen; 0 = none yet
 	ChannelReceiver chan_;
 	CommandSender uplink_;

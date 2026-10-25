@@ -168,21 +168,19 @@ struct ServerApp {
 	int packets_out = 0;
 
 	// The host interface Server::tick() calls back into.
-	bool live(DemoServer::Entity &e) { return e.key == SCOREBOARD_ID || balls.count(e.key); }
-	void prepare(DemoServer::Entity &e) {
-		if (e.key == SCOREBOARD_ID) {
-			e.slots = 2; // live balls, total bounces
-		} else {
-			e.slots = BALL_SLOTS;
-		}
+	bool live(DemoServer::Entity &e) { return e.key() == SCOREBOARD_ID || balls.count(e.key()); }
+	EntityLayout prepare(DemoServer::Entity &e) {
+		EntityLayout l;
+		l.slots = e.key() == SCOREBOARD_ID ? 2 : BALL_SLOTS; // the scoreboard: live balls, total bounces
+		return l;
 	}
 	void read(DemoServer::Entity &e, bool) {
-		if (e.key == SCOREBOARD_ID) {
+		if (e.key() == SCOREBOARD_ID) {
 			server.stamp(e, 0, Value((int64_t)balls.size()));
 			server.stamp(e, 1, Value(total_bounces));
 			return;
 		}
-		const Ball &b = balls[e.key];
+		const Ball &b = balls[e.key()];
 		server.stamp(e, 0, Value(b.x));
 		server.stamp(e, 1, Value(b.y));
 		server.stamp(e, 2, Value(atan2f(b.vy, b.vx)));
@@ -192,7 +190,7 @@ struct ServerApp {
 	bool spawn_visible(uint64_t, int32_t) { return true; }
 	// Every value whole and self-tagged: simple, and right against any base.
 	void encode(Writer &w, const DemoServer::Entity &e, int slot, const Value *, uint32_t now) {
-		encode_value(w, e.vals[slot], e.key == SCOREBOARD_ID ? QUANT_AUTO : BALL_QUANT[slot], now);
+		encode_value(w, e.value(slot), e.key() == SCOREBOARD_ID ? QUANT_AUTO : BALL_QUANT[slot], now);
 	}
 	void send(int32_t peer, const Writer &packet) {
 		Outgoing o{ peers[peer].addr, std::vector<uint8_t>(packet.data(), packet.data() + packet.size()) };
@@ -294,6 +292,7 @@ struct ServerApp {
 				const int32_t id = next_peer++;
 				peers[id] = PeerInfo{ from, now };
 				by_addr[key] = id;
+				server.add_peer(id);
 				printf("[server] peer %d joined from %s\n", id, key.c_str());
 			} else if (buf[0] == 'U' && it != by_addr.end()) {
 				peers[it->second].last_heard = now;
@@ -335,17 +334,14 @@ struct ServerApp {
 					spawn_ball();
 					next_spawn += 2000;
 				}
-				std::vector<int32_t> ids;
 				for (auto it = peers.begin(); it != peers.end();) {
 					const int32_t id = it->first;
 					++it;
 					if (now - peers[id].last_heard > TIMEOUT_MS) {
 						drop_peer(id, "timed out");
-					} else {
-						ids.push_back(id);
 					}
 				}
-				server.tick(now, ids, *this);
+				server.tick(now, *this);
 				next_tick += TICK_MS;
 			}
 
@@ -353,10 +349,11 @@ struct ServerApp {
 				printf("[server] %zu peers, %zu balls, %d snapshots/s, %.1f KB/s out\n", peers.size(),
 						balls.size(), packets_out, bytes_out / 1024.0);
 				for (auto &kv : peers) {
+					const DemoServer::PeerStats st = server.peer_stats(kv.first);
 					printf("[server]   peer %d: %u commands/s, %u out of order, %u given up on", kv.first,
-							kv.second.commands, kv.second.out_of_order, server.skipped_commands(kv.first));
-					if (server.peer_rate(kv.first)) {
-						printf(", rate %u B/s, choked %u times", server.peer_rate(kv.first), server.chokes(kv.first));
+							kv.second.commands, kv.second.out_of_order, st.commands_skipped);
+					if (st.rate) {
+						printf(", rate %u B/s, choked %u times", st.rate, st.chokes);
 					}
 					printf("\n");
 					kv.second.commands = 0;
@@ -426,7 +423,7 @@ struct ClientApp {
 	void make_command(uint32_t now) {
 		const uint32_t n = next_command++;
 		const uint8_t cmd[8] = { (uint8_t)n, (uint8_t)(n >> 8), (uint8_t)(n >> 16), (uint8_t)(n >> 24), 1, 2, 3, 4 };
-		client.uplink().push(CMD_STREAM, cmd, sizeof(cmd), now);
+		client.push_command(CMD_STREAM, cmd, sizeof(cmd), now);
 		if (!client.uplink_due(now)) {
 			return;
 		}
@@ -469,8 +466,9 @@ struct ClientApp {
 		}
 		const Ent &score = ents[SCOREBOARD_ID];
 		char cmds[96];
-		snprintf(cmds, sizeof(cmds), "%u commands sent, %zu unacked, rtt %u ms", next_command, client.uplink().pending(),
-				client.uplink().rtt_ms());
+		const Client<Value>::Stats st = client.stats();
+		snprintf(cmds, sizeof(cmds), "%u commands sent, %u unacked, rtt %u ms", next_command, st.commands_pending,
+				st.command_rtt_ms);
 		if (!tty) {
 			printf("[client] t=%.1fs %d snapshots (%d committed), %.1f KB/s, %d spawns, %d despawns, "
 				   "%lld balls, %lld bounces; %s\n",

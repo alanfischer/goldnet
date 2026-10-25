@@ -510,7 +510,7 @@ struct ClientCore {
 		in = quantize(in);
 		uint8_t bytes[INPUT_BYTES];
 		write_input(in, bytes);
-		const uint16_t seq = client.uplink().push(CMD_STREAM, bytes, sizeof(bytes), now);
+		const uint16_t seq = client.push_command(CMD_STREAM, bytes, sizeof(bytes), now);
 		history.push_back({ seq, in });
 		while (history.size() > COMMAND_RING) {
 			history.pop_front();
@@ -594,7 +594,7 @@ struct ClientCore {
 		return true;
 	}
 
-	float ping_ms() const { return (float)client.uplink().rtt_ms(); }
+	float ping_ms() const { return (float)client.stats().command_rtt_ms; }
 };
 
 } // namespace shove
