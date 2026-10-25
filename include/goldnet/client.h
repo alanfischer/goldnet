@@ -29,7 +29,8 @@
 //                                                  any of its values are applied
 //   void message(const uint8_t *data, size_t size, bool reliable)   one netchan message (netchan.h)
 //   bool spawn(uint32_t net_id, uint32_t spawner_net_id, const uint8_t *data, size_t size)
-//        create it; false = can't yet: the frame isn't acked, so the spawn is offered again
+//        create it; false = can't yet: the frame isn't acked, so the spawn is offered again, until
+//        the client gives up holding it (ApplyInfo::given_up)
 //   void despawn(uint32_t net_id)                  only for an id whose spawn() returned true
 //   void relevance_lost(uint32_t net_id)
 //
@@ -156,6 +157,11 @@ public:
 		int changed = 0;
 		uint16_t ack = 0;         // the snapshot ack it queued for the uplink; 0 = none
 		uint16_t command_ack = 0; // the header's: the newest command the server has; 0 = none
+		// The spawns the host refused and the entities it couldn't take, by net_id, when this snapshot
+		// was held as long as the client holds one (see apply) and acked anyway. The server takes them
+		// as delivered: a spawn here isn't sent again, and an entity here comes only as changes from
+		// values this end doesn't hold.
+		std::vector<uint32_t> given_up;
 	};
 
 	// The link, as this end sees it. Totals are this session's.
@@ -489,6 +495,8 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	// reference them.
 	const int spawn_ct = r.get_u16();
 	bool spawn_refused = false;
+	// What holds the ack, if anything does: the spawns refused, and the entities that set defer_ack below.
+	std::vector<uint32_t> holding;
 	for (int i = 0; i < spawn_ct && !r.failed(); i++) {
 		const uint32_t nid = r.get_u32();
 		const uint32_t spawner_nid = r.get_u32();
@@ -499,6 +507,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 				spawned_.insert(nid);
 			} else {
 				spawn_refused = true;
+				holding.push_back(nid);
 			}
 		}
 	}
@@ -555,6 +564,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 		const EntityResult res = p_host.entity(u);
 		if (res == ENTITY_NOT_READY) {
 			defer_ack = true;
+			holding.push_back(net_id);
 		}
 		if (res != ENTITY_APPLIED) {
 			continue;
@@ -563,8 +573,10 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 			// Known here, but not held at the baseline the server thinks it is: hold the ack, so the
 			// server keeps diffing against a frame we have, until the cap gives up.
 			defer_ack = true;
+			holding.push_back(net_id);
 		} else if (u.reader().failed() || u.set_ != mask) {
 			defer_ack = true; // the host read the slots differently than they were written: not a frame to ack
+			holding.push_back(net_id);
 		} else {
 			frame[net_id] = std::move(u.vals_);
 		}
@@ -609,13 +621,18 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	//
 	// A refused spawn holds the same way, for the same reason: acking a frame that carries it tells
 	// the server it was delivered, and it's never sent again.
-	if ((spawn_refused || defer_ack) && defer_streak_ < MAX_DEFER_STREAK) {
-		defer_streak_++;
-		if (has_) {
-			queue_ack(last_seq_, info);
+	//
+	// Past the cap the frame is acked anyway, which loses what was holding it, so the host is told.
+	if (spawn_refused || defer_ack) {
+		if (defer_streak_ < MAX_DEFER_STREAK) {
+			defer_streak_++;
+			if (has_) {
+				queue_ack(last_seq_, info);
+			}
+			info.status = STATUS_HELD;
+			return info;
 		}
-		info.status = STATUS_HELD;
-		return info;
+		info.given_up = std::move(holding);
 	}
 	defer_streak_ = 0;
 

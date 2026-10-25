@@ -1,4 +1,4 @@
-# goldnet wire protocol (version 8)
+# goldnet wire protocol (version 10)
 
 The byte-level contract between goldnet's two ends: what a snapshot and an uplink packet contain,
 how each value is encoded, and what each end does with them. The README's **How it
@@ -56,7 +56,7 @@ the datagram. A message is `uvarint target` and then:
 One per peer per send, server to client.
 
 ```
-u8   version        WIRE_VERSION = 8
+u8   version        WIRE_VERSION = 10
 u16  seq            this frame's number for this peer
 u16  base_seq       the frame this one is a delta against; 0 = full state
 u32  server_time    the server's clock at send, ms
@@ -72,8 +72,8 @@ u16  changed_ct     then changed_ct × entity entry
 ```
 
 Only the first 11 bytes sit at fixed offsets; each count is followed directly by its entries. The
-fixed part (header with the uplink report at 3 bytes a field, an empty channel part and the four
-counts) is `SNAPSHOT_HEADER_BYTES` = 30.
+fixed part (header with the uplink report at 3 bytes a field and the update rate at 2, an empty
+channel part and the four counts) is `SNAPSHOT_HEADER_BYTES` = 32.
 
 **Spawn entry** — a runtime entity the client must create before any delta can reach it:
 
@@ -98,7 +98,8 @@ u8       kinds_check         only when whole: the server host's summary of how i
 ```
 
 A slot is an index into the entity's replicated properties — in Godot, the order of its
-synchronizer's `SceneReplicationConfig`. At most `MAX_SLOTS` = 32. The slots' bytes are the host's:
+synchronizer's `SceneReplicationConfig`. At most `MAX_SLOTS` = 32: an entity declared with more
+replicates only the first 32. The slots' bytes are the host's:
 a slot the host declares stepped is coded against `base`, the value the peer holds for it at
 `base_seq`, unless `whole` is set, when there is no base. An entity goes whole when the peer doesn't
 hold it at the baseline, or when a changed stepped slot's value at the baseline has left the
@@ -336,7 +337,8 @@ built against whichever frame the peer acks.
 For each snapshot:
 
 1. **Version.** Not `WIRE_VERSION` → drop it (and warn once per session).
-2. **Order.** `seq` not newer than the last committed frame → drop it.
+2. **Order.** `seq` not newer than the last committed frame, or than the newest snapshot received
+   (committed or not) → drop it, so its messages can't play after a newer packet's.
 3. **Clock.** Surface `server_time` and `command_ack` — even if the next step drops the snapshot.
 4. **Baseline.** If `base_seq` ≠ 0 and that frame isn't in the ring, re-ack the last committed
    frame and drop the snapshot. The server keeps diffing against frames the client holds,
@@ -351,12 +353,15 @@ For each snapshot:
    (they repeat the same way), then entities that no longer exist locally are dropped from the
    frame, then leaves are dropped from it and reported.
 6. **Truncated.** If the packet ran short, keep whatever it applied but neither commit nor ack.
-7. **Warmup.** If an entity the client knows of couldn't take its values yet (not ready), re-ack
-   the last committed frame instead of this one, for up to 32 frames in a row (and only once some
-   frame has been committed; the very first is always accepted). Acking would tell the server the
-   entity's state was delivered, and an idle entity would then never be resent. A spawn the client
-   couldn't create holds the frame the same way, and also on the very first frame, which it leaves
-   unacked: acking a frame carrying a spawn retires it, so it would come only when overdue.
+7. **Hold.** If an entity the client knows of couldn't take its values (not ready, not in the
+   baseline, or read differently than it was written), or a spawn couldn't be created, don't
+   commit the frame: re-ack the last committed one instead, or ack nothing if none is committed
+   yet. Acking would tell the server the entity's state or the spawn was delivered, and an idle
+   entity or the spawn would then never be resent. After 32 held frames in a row the next is
+   committed and acked anyway, so the stream can't stall for good; the client tells its host which
+   spawns and entities that gave up on (`ApplyInfo::given_up`). A spawn resends only when overdue,
+   so the frames between its copies commit and reset the count: it is given up on only when every
+   snapshot carries it, as when they come further apart than its resend interval.
 8. **Commit.** Store the frame under `seq`, make it the last committed frame, and ack `seq`.
 
 The server, on an ack newer than the peer's previous one, makes that frame the peer's baseline and

@@ -116,6 +116,7 @@ struct Peer {
 	std::map<uint32_t, std::vector<Val>> vals; // what has been applied
 	std::map<uint32_t, int> synced;           // net_id -> times `synchronized` fired
 	std::vector<uint32_t> spawned, despawned, lost;
+	std::vector<uint32_t> given_up; // ApplyInfo::given_up, every snapshot's
 	std::vector<uint16_t> acks;
 	std::vector<Status> statuses; // of every snapshot delivered, in order
 	std::vector<uint32_t> times;
@@ -241,6 +242,7 @@ struct Net {
 				TestClientHost ch{ &p };
 				const Client<Val>::ApplyInfo info = p.client.apply(pkt.data(), pkt.size(), ch, now);
 				p.statuses.push_back(info.status);
+				p.given_up.insert(p.given_up.end(), info.given_up.begin(), info.given_up.end());
 				if (info.ack) {
 					p.acks.push_back(info.ack);
 				}
@@ -546,6 +548,74 @@ static void test_resent_spawn_reaches_host_once() {
 	CHECK(a.spawned == (std::vector<uint32_t>{ 500, 500 })); // a reused id spawns again
 	CHECK(a.despawned == std::vector<uint32_t>{ 500 });      // and the new one stays
 	printf("  resent spawns and despawns reach the host once: ok\n");
+}
+
+// A host that refuses a spawn for good can't hold the stream forever. When snapshots come further
+// apart than a spawn's resend interval, every one carries it again and is held, so past the hold cap
+// the client acks one anyway, which the server takes as delivery, and says so, naming the spawn.
+static void test_refused_spawn_is_given_up_and_reported() {
+	Net n;
+	Peer &a = n.add_peer(2);
+	n.add_entity(10, 100, { 1 });
+	n.server.add_spawn(500, TestServer::SpawnRecord());
+	a.refuse_spawns = 1000;
+	for (int i = 0; i < 100 && a.given_up.empty(); i++) {
+		n.world.ents[10].vals[0]++; // keep snapshots going
+		n.tick(100);                // 10 Hz: every snapshot is past overdue_ms
+	}
+	CHECK(a.given_up == std::vector<uint32_t>{ 500 });
+	CHECK(a.statuses.front() == STATUS_HELD && a.statuses.back() == STATUS_OK);
+	for (int i = 0; i < 10; i++) {
+		n.world.ents[10].vals[0]++;
+		n.tick(100);
+	}
+	CHECK(a.given_up.size() == 1); // the server took it as delivered, so it isn't offered again
+	CHECK(a.vals[100][0] == n.world.ents[10].vals[0]); // and the rest of the stream carries on
+	printf("  a spawn refused past the hold cap is given up on, and reported: ok\n");
+}
+
+// The same for an entity that never gets ready.
+static void test_entity_never_ready_is_given_up_and_reported() {
+	Net n;
+	Peer &a = n.add_peer(2);
+	n.add_entity(10, 100, { 1 });
+	n.add_entity(11, 101, { 1 });
+	n.tick();
+	a.not_ready.insert(101);
+	for (int i = 0; i < 100 && a.given_up.empty(); i++) {
+		n.world.ents[10].vals[0]++;
+		n.world.ents[11].vals[0]++;
+		n.tick();
+	}
+	CHECK(a.given_up == std::vector<uint32_t>{ 101 });
+	CHECK(a.vals[100][0] == n.world.ents[10].vals[0]);
+	printf("  an entity never ready is given up on past the hold cap, and reported: ok\n");
+}
+
+// An entity can't have more slots than the changed-slot mask is wide: the ones past it don't
+// replicate, and the rest do.
+static void test_slots_past_max_are_dropped() {
+	Net n;
+	Peer &a = n.add_peer(2);
+	std::vector<Val> vals(MAX_SLOTS + 8);
+	for (size_t s = 0; s < vals.size(); s++) {
+		vals[s] = (Val)s + 1;
+	}
+	n.world.ents[10].push.assign(vals.size(), 0);
+	n.world.ents[10].push[3] = 1; // lines up with the slots declared, so it holds for the ones kept
+	n.add_entity(10, 100, vals);
+	CHECK(n.server.find(10)->slots() == MAX_SLOTS);
+	CHECK(n.server.find(10)->pushed(3) && !n.server.find(10)->pushed(2));
+	n.tick();
+	CHECK(a.vals[100].size() == vals.size());
+	for (int s = 0; s < MAX_SLOTS; s++) {
+		CHECK(a.vals[100][s] == vals[s]);
+	}
+	CHECK(a.vals[100][MAX_SLOTS] == 0); // never sent
+	n.world.ents[10].vals[MAX_SLOTS - 1] = 99;
+	n.tick();
+	CHECK(a.vals[100][MAX_SLOTS - 1] == 99);
+	printf("  slots past MAX_SLOTS don't replicate, and the rest do: ok\n");
 }
 
 // A refused spawn holds the ack, even on the very first frame: acking would retire the spawn as
@@ -1398,6 +1468,9 @@ int main() {
 	test_command_ack_rides_the_header();
 	test_receive_uplink_takes_the_whole_packet();
 	test_refused_spawn_holds_ack();
+	test_refused_spawn_is_given_up_and_reported();
+	test_entity_never_ready_is_given_up_and_reported();
+	test_slots_past_max_are_dropped();
 	test_unacked_spawn_resends_only_when_overdue();
 	test_ack_of_a_later_frame_does_not_retire_a_spawn();
 	test_entity_sent_whole_until_its_spawn_is_proven();

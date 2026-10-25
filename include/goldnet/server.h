@@ -93,6 +93,7 @@ struct NoUserData {};
 // How an entity's slots replicate, as add_entity takes it. Fixed for the entity's life; adding it
 // again replaces it.
 struct EntityLayout {
+	// At most MAX_SLOTS: the slots past it don't replicate.
 	int slots = 0;
 	// Per slot: the host codes it against the peer's baseline value (encode's base), so the server
 	// keeps its recent values. Empty means none is.
@@ -187,10 +188,12 @@ public:
 		e->net_id_ = p_net_id;
 		EntityLayout &l = e->layout_;
 		l = std::move(p_layout);
-		l.slots = std::max(l.slots, 0);
-		if (l.push.size() != (size_t)l.slots) {
+		const int declared = std::max(l.slots, 0);
+		l.slots = std::min(declared, MAX_SLOTS); // the width of the changed-slot mask
+		if (l.push.size() != (size_t)declared) {
 			l.push.clear(); // a declaration that doesn't line up with the slots declares nothing
 		}
+		l.push.resize(l.push.empty() ? 0 : l.slots);
 		e->has_polled_ = l.push.empty() || std::find(l.push.begin(), l.push.end(), 0) != l.push.end();
 		e->vals_.assign(l.slots, V());
 		// Newer than any frame sent so far, so a peer that held an entity at this net_id before (a key
