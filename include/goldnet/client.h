@@ -50,6 +50,7 @@
 #include "goldnet/protocol.h"
 #include "goldnet/uplink.h"
 
+#include <algorithm>
 #include <cmath>
 #include <unordered_map>
 #include <unordered_set>
@@ -343,8 +344,58 @@ public:
 	}
 
 private:
-	// A frame is { net_id -> its slot values, in slot order }.
-	typedef std::unordered_map<uint32_t, std::vector<V>> Frame;
+	// One entity's slot values, shared by every frame that holds them unchanged: a frame copies a
+	// reference per entity, and a snapshot makes new values only for the entities it changes. Counted
+	// by hand, since a client is single-threaded and a shared_ptr's count is atomic.
+	class Values {
+	public:
+		Values() = default;
+		explicit Values(std::vector<V> &&p_vals) : block_(new Block{ 1, std::move(p_vals) }) {}
+		Values(const Values &p_other) : block_(p_other.block_) {
+			if (block_) {
+				block_->refs++;
+			}
+		}
+		Values(Values &&p_other) noexcept : block_(p_other.block_) { p_other.block_ = nullptr; }
+		Values &operator=(Values p_other) noexcept {
+			std::swap(block_, p_other.block_);
+			return *this;
+		}
+		~Values() {
+			if (block_ && --block_->refs == 0) {
+				delete block_;
+			}
+		}
+		const std::vector<V> &get() const { return block_->vals; }
+
+	private:
+		struct Block {
+			uint32_t refs;
+			std::vector<V> vals;
+		};
+		Block *block_ = nullptr;
+	};
+
+	// A frame is each entity it holds and its slot values, in slot order, sorted by net_id.
+	struct Held {
+		uint32_t net_id;
+		Values vals;
+	};
+	struct Frame {
+		std::vector<Held> held;
+
+		Held *find(uint32_t p_net_id) {
+			auto it = std::lower_bound(held.begin(), held.end(), p_net_id,
+					[](const Held &h, uint32_t id) { return h.net_id < id; });
+			return it != held.end() && it->net_id == p_net_id ? &*it : nullptr;
+		}
+		void erase(uint32_t p_net_id) {
+			if (Held *h = find(p_net_id)) {
+				held.erase(held.begin() + (h - held.data()));
+			}
+		}
+		void clear() { held.clear(); }
+	};
 
 	// Receive history — a mirror of the server's ring, so a delta can be reconstructed against any
 	// recent baseline the server might diff against.
@@ -542,11 +593,14 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	const int count = r.get_u16();
 	info.changed = count;
 
-	// New frame = baseline carried forward, with this delta's changed fields applied.
+	// New frame = baseline carried forward, with this delta's changed fields applied. Carried forward
+	// as references to the baseline's values; the entities this snapshot brings that the baseline
+	// lacks go in `added`, and join the frame once every update is read.
 	Frame frame;
 	if (base) {
-		frame = *base;
+		frame.held = base->held;
 	}
+	std::vector<Held> added;
 
 	// Set if a KNOWN entity couldn't be applied because it isn't ready yet — the warmup window. We
 	// must not ack this frame as delivered (see the defer block below), or the server folds the
@@ -570,10 +624,10 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 		// be applied to the value it is a change from, so a delta for an entity missing from the
 		// baseline frame can't be applied at all: the host is offered no slots, and can only say
 		// whether it has the entity.
-		auto cur = frame.find(net_id);
-		const bool held = whole || cur != frame.end();
+		Held *cur = frame.find(net_id);
+		const bool held = whole || cur;
 		EntityUpdate<V> u(net_id, whole, kinds_check, server_time, held ? mask : 0, data, len,
-				cur != frame.end() ? &cur->second : nullptr);
+				cur ? &cur->vals.get() : nullptr);
 		const EntityResult res = p_host.entity(u);
 		if (res == ENTITY_NOT_READY) {
 			defer_ack = true;
@@ -590,8 +644,10 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 		} else if (u.reader().failed() || u.set_ != mask) {
 			defer_ack = true; // the host read the slots differently than they were written: not a frame to ack
 			holding.push_back(net_id);
+		} else if (cur) {
+			cur->vals = Values(std::move(u.vals_));
 		} else {
-			frame[net_id] = std::move(u.vals_);
+			added.push_back({ net_id, Values(std::move(u.vals_)) });
 		}
 	}
 
@@ -604,24 +660,51 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 		return info;
 	}
 
+	// The entities the baseline lacked, in order. A corrupt packet could name one twice; the last wins.
+	if (!added.empty()) {
+		std::stable_sort(added.begin(), added.end(), [](const Held &a, const Held &b) { return a.net_id < b.net_id; });
+		std::vector<Held> merged;
+		merged.reserve(frame.held.size() + added.size());
+		size_t fi = 0;
+		for (size_t ai = 0; ai < added.size(); ai++) {
+			if (ai + 1 < added.size() && added[ai + 1].net_id == added[ai].net_id) {
+				continue;
+			}
+			while (fi < frame.held.size() && frame.held[fi].net_id < added[ai].net_id) {
+				merged.push_back(std::move(frame.held[fi++]));
+			}
+			merged.push_back(std::move(added[ai]));
+		}
+		while (fi < frame.held.size()) {
+			merged.push_back(std::move(frame.held[fi++]));
+		}
+		frame.held.swap(merged);
+	}
+
 	// Now free despawned entities (after the deltas so nothing applies to one we then free), and stop
 	// holding their values, as the server no longer does.
+	std::vector<uint32_t> gone;
 	for (uint32_t nid : despawns) {
 		if (spawned_.erase(nid)) {
 			p_host.despawn(nid);
 		}
-		frame.erase(nid);
-	}
-	// And any the host did away with meanwhile (forget()).
-	for (uint32_t nid : forgotten_) {
-		frame.erase(nid);
+		gone.push_back(nid);
 	}
 
 	// Relevance leaves: drop from the reconstructed frame (so it matches the server's baseline,
 	// which also dropped these) and tell the host to hide the entity.
 	for (uint32_t nid : leaves) {
-		frame.erase(nid);
+		gone.push_back(nid);
 		p_host.relevance_lost(nid);
+	}
+
+	// And any the host did away with meanwhile (forget()), these callbacks included.
+	gone.insert(gone.end(), forgotten_.begin(), forgotten_.end());
+	if (!gone.empty()) {
+		std::sort(gone.begin(), gone.end());
+		frame.held.erase(std::remove_if(frame.held.begin(), frame.held.end(),
+								 [&gone](const Held &h) { return std::binary_search(gone.begin(), gone.end(), h.net_id); }),
+				frame.held.end());
 	}
 
 	// Warmup defer: a known entity wasn't ready, so we couldn't apply (reveal) it. Committing +
