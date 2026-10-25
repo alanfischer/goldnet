@@ -48,30 +48,32 @@ struct TestServerHost {
 	World *world;
 	TestServer *server;
 
-	bool live(TestServer::Entity &e) { return world->ents.count(e.key) > 0; }
-	void prepare(TestServer::Entity &e) {
-		const WorldEnt &w = world->ents[e.key];
-		e.slots = (int)w.vals.size();
-		e.push = w.push;
-		e.priority = w.priority;
-		e.stepped.assign(e.slots, 1);
-		e.kinds_check = 7;
+	bool live(TestServer::Entity &e) { return world->ents.count(e.key()) > 0; }
+	EntityLayout prepare(TestServer::Entity &e) {
+		const WorldEnt &w = world->ents[e.key()];
+		EntityLayout l;
+		l.slots = (int)w.vals.size();
+		l.push = w.push;
+		l.priority = w.priority;
+		l.stepped.assign(l.slots, 1);
+		l.kinds_check = 7;
+		return l;
 	}
 	void read(TestServer::Entity &e, bool polled_only) {
 		world->reads++;
-		const WorldEnt &w = world->ents[e.key];
-		for (int s = 0; s < e.slots; s++) {
-			if (polled_only && TestServer::skip_on_poll(e, s)) {
+		const WorldEnt &w = world->ents[e.key()];
+		for (int s = 0; s < e.slots(); s++) {
+			if (polled_only && e.pushed(s)) {
 				continue;
 			}
 			server->stamp(e, s, w.vals[s]);
 		}
 	}
-	bool visible(const TestServer::Entity &e, int32_t peer) { return world->is_visible(e.key, peer); }
+	bool visible(const TestServer::Entity &e, int32_t peer) { return world->is_visible(e.key(), peer); }
 	bool spawn_visible(uint64_t key, int32_t peer) { return world->is_visible(key, peer); }
 	// An int as its step from the peer's baseline value, the way a host codes an int slot.
 	void encode(Writer &w, const TestServer::Entity &e, int slot, const Val *base, uint32_t) {
-		put_varint(&w, e.vals[slot] - (base ? *base : 0));
+		put_varint(&w, e.value(slot) - (base ? *base : 0));
 	}
 	void send(int32_t peer, const Writer &w) {
 		world->outbox[peer].emplace_back(w.data(), w.data() + w.size());
@@ -180,6 +182,7 @@ struct Net {
 	Peer &add_peer(int32_t id) {
 		Peer &p = peers[id];
 		p.id = id;
+		server.add_peer(id);
 		return p;
 	}
 
@@ -194,13 +197,9 @@ struct Net {
 	// One server tick, then deliver every packet and every ack the link lets through.
 	void tick(uint32_t dt = 16) {
 		now += dt;
-		std::vector<int32_t> ids;
-		for (auto &kv : peers) {
-			ids.push_back(kv.first);
-		}
 		world.outbox.clear();
 		TestServerHost sh{ &world, &server };
-		server.tick(now, ids, sh);
+		server.tick(now, sh);
 		for (auto &kv : world.outbox) {
 			Peer &p = peers[kv.first];
 			for (auto &pkt : kv.second) {
@@ -775,7 +774,7 @@ static void test_update_rate_throttles_one_peer() {
 	CHECK(fast_sent == 30);
 	CHECK(slow_sent == 10);             // every 3rd tick, though the gaps measure 49 ms
 	CHECK(slow.vals[100][0] >= 27);     // and it still converges
-	CHECK(fast.client.update_rate_granted() == 60 && slow.client.update_rate_granted() == 20);
+	CHECK(fast.client.stats().update_rate_granted == 60 && slow.client.stats().update_rate_granted == 20);
 	printf("  an update rate throttles only that peer, every nth tick: ok\n");
 }
 
@@ -790,7 +789,7 @@ static void test_update_rate_grant() {
 		p.client.set_rate(rate);
 		n.send_uplink(p);
 		n.tick(1000);
-		return n.server.update_rate(2);
+		return n.server.peer_stats(2).update_rate;
 	};
 	CHECK(granted(0, 0) == 0); // nothing asked, snapshot rate unknown: every tick
 	CHECK(granted(25, 0) == 25);
@@ -950,8 +949,8 @@ static void test_rate_chokes_to_the_budget() {
 	CHECK(fast_packets == 125);                  // unrated: every tick
 	CHECK(slow_bytes <= 2000 * 2 + 200);         // rated: within its budget (plus the packet in hand)
 	CHECK(slow_packets < fast_packets / 2);      // by sending less often, not by sending nothing
-	CHECK(n.server.chokes(3) > 0);
-	CHECK(n.server.chokes(2) == 0);
+	CHECK(n.server.peer_stats(3).chokes > 0);
+	CHECK(n.server.peer_stats(2).chokes == 0);
 	CHECK(slow.vals[100][0] >= 120);             // and still current, not a backlog behind
 	printf("  rate chokes a peer to its budget, and it stays current: ok\n");
 }
@@ -972,7 +971,7 @@ static void test_charged_traffic_delays_the_next_snapshot() {
 		sent += (int)n.sent_to(2);
 	}
 	CHECK(sent == 0);
-	CHECK(n.server.chokes(2) == 25);
+	CHECK(n.server.peer_stats(2).chokes == 25);
 	printf("  other traffic charged to a peer delays its next snapshot: ok\n");
 }
 
@@ -985,11 +984,11 @@ static void test_command_ack_rides_the_header() {
 	n.tick();
 	CHECK(n.sent_to(2) == 0); // idle
 	const uint8_t cmd[1] = { 7 };
-	p.client.uplink().push(1, cmd, sizeof(cmd), n.now);
+	p.client.push_command(1, cmd, sizeof(cmd), n.now);
 	n.send_uplink(p);
-	CHECK(n.uplink_host.commands.size() == 1 && p.client.uplink().pending() == 1);
+	CHECK(n.uplink_host.commands.size() == 1 && p.client.stats().commands_pending == 1);
 	n.tick();
-	CHECK(n.sent_to(2) == 1 && p.client.uplink().pending() == 0);
+	CHECK(n.sent_to(2) == 1 && p.client.stats().commands_pending == 0);
 	n.tick();
 	CHECK(n.sent_to(2) == 0); // told once
 	printf("  the command ack rides the header and earns a send when new: ok\n");
@@ -1009,10 +1008,10 @@ static void test_receive_uplink_takes_the_whole_packet() {
 	p.client.set_rate(20000);
 	p.client.set_update_rate(20);
 	const uint8_t cmd[3] = { 1, 2, 3 };
-	p.client.uplink().push(1, cmd, sizeof(cmd), n.now);
+	p.client.push_command(1, cmd, sizeof(cmd), n.now);
 	CHECK(n.send_uplink(p));
 	CHECK(n.uplink_host.commands == std::vector<std::vector<uint8_t>>{ std::vector<uint8_t>(cmd, cmd + 3) });
-	CHECK(n.server.peer_rate(2) == 20000);
+	CHECK(n.server.peer_stats(2).rate == 20000);
 
 	n.world.ents[10].vals[0] = 1;
 	for (int i = 0; i < 4 && (i == 0 || n.sent_to(2) == 0); i++) {
@@ -1020,12 +1019,12 @@ static void test_receive_uplink_takes_the_whole_packet() {
 	}
 	CHECK(n.sent_to(2) == 1);
 	CHECK(base_seq_of(n.last_packet(2)) == p.acks.front()); // the uplink's snapshot ack landed
-	CHECK(p.client.uplink().pending() == 0);                // and its command was acked
-	CHECK(n.server.update_rate(2) == 20 && p.client.update_rate_granted() == 20);
+	CHECK(p.client.stats().commands_pending == 0);                // and its command was acked
+	CHECK(n.server.peer_stats(2).update_rate == 20 && p.client.stats().update_rate_granted == 20);
 
 	p.client.set_rate(200); // under the floor
 	n.send_uplink(p);
-	CHECK(n.server.peer_rate(2) == MIN_RATE);
+	CHECK(n.server.peer_stats(2).rate == MIN_RATE);
 	printf("  receive_uplink takes the commands, the acks and the rates: ok\n");
 }
 
@@ -1038,9 +1037,9 @@ static void test_uplink_report_rides_the_header() {
 		n.world.ents[10].vals[0] = i;
 		n.tick();
 	}
-	CHECK(p.client.uplink_lag_ms() == 0);
-	CHECK(p.client.uplink_pps() >= 55 && p.client.uplink_pps() <= 70);
-	CHECK(n.server.uplink_pps(2) == p.client.uplink_pps());
+	CHECK(p.client.stats().uplink_lag_ms == 0);
+	CHECK(p.client.stats().uplink_pps >= 55 && p.client.stats().uplink_pps <= 70);
+	CHECK(n.server.peer_stats(2).uplink_pps == p.client.stats().uplink_pps);
 	printf("  the uplink report rides the snapshot header: ok\n");
 }
 
@@ -1053,21 +1052,21 @@ static void test_link_settings_reach_the_uplink() {
 	Client<Val> &c = p.client;
 	c.set_rate(5000);
 	c.set_command_rate(20.0);
-	CHECK(c.uplink().rate() == 5000 && c.uplink().interval_ms() == 50);
+	CHECK(c.stats().rate == 5000 && c.stats().command_interval_ms == 50);
 	c.set_auto_rate(true);
-	CHECK(c.uplink().rate() == 0);         // no limit until the downlink queues
+	CHECK(c.stats().rate == 0);         // no limit until the downlink queues
 	c.set_auto_command_rate(true, 60.0);
-	CHECK(c.uplink().interval_ms() == 50); // CmdRateAuto starts at 20 Hz
+	CHECK(c.stats().command_interval_ms == 50); // CmdRateAuto starts at 20 Hz
 	for (int i = 0; i < 200; i++) {        // 3.2 s of an uplink that never queues
 		n.world.ents[10].vals[0] = i;
 		n.tick();
 	}
-	CHECK(c.uplink().interval_ms() < 50);  // so it climbed
+	CHECK(c.stats().command_interval_ms < 50);  // so it climbed
 	c.reset();
-	CHECK(c.uplink().interval_ms() == 50 && c.auto_rate() && c.update_rate_granted() == -1);
+	CHECK(c.stats().command_interval_ms == 50 && c.auto_rate() && c.stats().update_rate_granted == -1);
 	c.set_auto_rate(false);
 	c.set_auto_command_rate(false, 60.0);
-	CHECK(c.uplink().rate() == 5000 && c.uplink().interval_ms() == 50);
+	CHECK(c.stats().rate == 5000 && c.stats().command_interval_ms == 50);
 	printf("  the link settings and the automatic picks reach the uplink: ok\n");
 }
 
@@ -1083,14 +1082,13 @@ static void test_ack_rides_a_flowing_command_stream() {
 	n.send_uplink(p);
 	CHECK(!p.client.uplink_due(n.now));
 
-	CommandSender &up = p.client.uplink();
 	p.client.set_command_rate(20.0);
 	const uint8_t cmd[1] = { 1 };
-	up.push(1, cmd, sizeof(cmd), n.now);
+	p.client.push_command(1, cmd, sizeof(cmd), n.now);
 	n.send_uplink(p); // the interval starts
 	n.world.ents[10].vals[0] = 2;
 	n.tick();
-	up.push(1, cmd, sizeof(cmd), n.now);
+	p.client.push_command(1, cmd, sizeof(cmd), n.now);
 	CHECK(!p.client.uplink_due(n.now)); // flowing: the ack waits for the next command packet
 	n.now += 40;
 	CHECK(p.client.uplink_due(n.now));  // which is due now, and carries it
@@ -1112,9 +1110,9 @@ static void test_arrival_stats_count_only_real_loss() {
 	for (int i = 0; i < 40; i++) { // 640 ms idle: two keepalives, ~38 skipped ticks
 		n.tick();
 	}
-	auto s = p.client.arrival_stats();
-	CHECK(s.received == 3);
-	CHECK(s.lost == 0);
+	auto s = p.client.stats();
+	CHECK(s.snapshots_received == 3);
+	CHECK(s.snapshots_lost == 0);
 
 	n.drop_snapshots.insert(2);
 	for (int v = 2; v < 5; v++) { // three changes, three snapshots, all lost
@@ -1124,9 +1122,9 @@ static void test_arrival_stats_count_only_real_loss() {
 	n.drop_snapshots.clear();
 	n.world.ents[10].vals[0] = 9;
 	n.tick();
-	s = p.client.arrival_stats();
-	CHECK(s.received == 4);
-	CHECK(s.lost == 3);
+	s = p.client.stats();
+	CHECK(s.snapshots_received == 4);
+	CHECK(s.snapshots_lost == 3);
 
 	n.world.ents[10].vals[0] = 10;
 	n.drop_snapshots.insert(2);
@@ -1137,9 +1135,9 @@ static void test_arrival_stats_count_only_real_loss() {
 	n.tick();
 	TestClientHost ch{ &p };
 	p.client.apply(late.data(), late.size(), ch, n.now);
-	s = p.client.arrival_stats();
-	CHECK(s.received == 6);
-	CHECK(s.lost == 3); // the late one took its loss back off
+	s = p.client.stats();
+	CHECK(s.snapshots_received == 6);
+	CHECK(s.snapshots_lost == 3); // the late one took its loss back off
 	printf("  arrival stats count only real loss: ok\n");
 }
 
@@ -1160,7 +1158,7 @@ static void test_messages_ride_the_snapshot_in_order() {
 	n.server.queue_unreliable(2, u4, 1);
 	n.tick();
 	CHECK((a.events == std::vector<std::string>{ "r1", "s500", "u2", "r3", "u4", "d500" }));
-	CHECK(n.server.reliable_delivered(2) == 2);
+	CHECK(n.server.peer_stats(2).messages_delivered == 2);
 	printf("  messages ride the snapshot, ordered around its spawns and despawns: ok\n");
 }
 
@@ -1182,8 +1180,38 @@ static void test_messages_survive_a_lost_snapshot() {
 		n.tick();
 	}
 	CHECK((a.events == std::vector<std::string>{ "r1" }));
-	CHECK(n.server.reliable_delivered(2) == 1);
+	CHECK(n.server.peer_stats(2).messages_delivered == 1);
 	printf("  a lost snapshot's reliable block comes again, its datagram doesn't: ok\n");
+}
+
+// The server serves only the peers added. A packet or a message for any other peer is dropped and
+// leaves nothing behind, so a late uplink packet from a peer already removed can't bring it back.
+static void test_only_added_peers_are_served() {
+	Net n;
+	Peer &a = n.add_peer(2);
+	n.add_entity(10, 100, { 1 });
+	n.tick();
+	CHECK(n.sent_to(2) == 1);
+	CHECK((n.server.peers() == std::vector<int32_t>{ 2 }));
+
+	n.server.remove_peer(2);
+	CHECK(!n.server.has_peer(2) && n.server.peers().empty());
+	const uint8_t cmd[1] = { 7 };
+	a.client.push_command(1, cmd, sizeof(cmd), n.now);
+	CHECK(!n.send_uplink(a)); // a late packet from it goes nowhere
+	CHECK(n.uplink_host.commands.empty());
+	CHECK(!n.server.queue_reliable(2, cmd, 1) && !n.server.queue_unreliable(2, cmd, 1));
+	CHECK(!n.server.has_peer(2) && n.server.peer_stats(2).messages_queued == 0);
+	n.world.ents[10].vals[0] = 2;
+	n.tick();
+	CHECK(n.sent_to(2) == 0);
+
+	n.server.add_peer(2); // back, as a new peer: a full frame
+	n.server.add_peer(2); // and adding it twice is adding it once
+	CHECK((n.server.peers() == std::vector<int32_t>{ 2 }));
+	n.tick();
+	CHECK(n.sent_to(2) == 1 && base_seq_of(n.last_packet(2)) == 0);
+	printf("  only the peers added are served, and a removed one stays removed: ok\n");
 }
 
 int main() {
@@ -1229,6 +1257,7 @@ int main() {
 	test_link_settings_reach_the_uplink();
 	test_messages_ride_the_snapshot_in_order();
 	test_messages_survive_a_lost_snapshot();
+	test_only_added_peers_are_served();
 	printf("%d checks passed\n", checks);
 	return 0;
 }

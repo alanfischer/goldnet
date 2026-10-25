@@ -98,17 +98,19 @@ struct ServerApp {
 
 	// --- goldnet's host interface (Server::tick) ---
 
-	bool live(GServer::Entity &e) { return players.count(e.net_id) || blocks.count(e.net_id); }
-	void prepare(GServer::Entity &e) {
-		if (players.count(e.net_id)) {
-			e.slots = PLAYER_SLOTS;
-			e.priority = 4.0f; // players before blocks when a packet overflows
+	bool live(GServer::Entity &e) { return players.count(e.net_id()) || blocks.count(e.net_id()); }
+	EntityLayout prepare(GServer::Entity &e) {
+		EntityLayout l;
+		if (players.count(e.net_id())) {
+			l.slots = PLAYER_SLOTS;
+			l.priority = 4.0f; // players before blocks when a packet overflows
 		} else {
-			e.slots = BLOCK_SLOTS;
+			l.slots = BLOCK_SLOTS;
 		}
+		return l;
 	}
 	void read(GServer::Entity &e, bool) {
-		auto pit = players.find(e.net_id);
+		auto pit = players.find(e.net_id());
 		if (pit != players.end()) {
 			const SPlayer &p = pit->second;
 			const vec3 &pos = p.body->get_position();
@@ -124,7 +126,7 @@ struct ServerApp {
 			server.stamp(e, PS_COOLDOWN, Value((int64_t)p.cooldown));
 			return;
 		}
-		const SBlock &b = blocks[e.net_id];
+		const SBlock &b = blocks[e.net_id()];
 		const vec3 &pos = b.body->get_position();
 		const quat &q = b.body->get_orientation_quat();
 		const float v[] = { pos.x, pos.y, pos.z, q.x, q.y, q.z, q.w };
@@ -136,7 +138,7 @@ struct ServerApp {
 	bool spawn_visible(uint64_t, int32_t) { return true; }
 	// Every value whole and self-tagged: simple, and right against any base.
 	void encode(Writer &w, const GServer::Entity &e, int slot, const Value *, uint32_t) {
-		encode_value(w, e.vals[slot], (players.count(e.net_id) ? player_quant() : block_quant())[slot]);
+		encode_value(w, e.value(slot), (players.count(e.net_id()) ? player_quant() : block_quant())[slot]);
 	}
 	void send(int32_t peer, const Writer &packet) {
 		Outgoing o{ peers[peer].addr, std::vector<uint8_t>(packet.data(), packet.data() + packet.size()) };
@@ -504,6 +506,7 @@ struct ServerApp {
 		p.addr = from;
 		p.last_heard = now;
 		by_addr[from] = peer;
+		server.add_peer(peer);
 		// Make room by retiring a bot if the arena is full.
 		if ((int)players.size() >= MAX_PLAYERS) {
 			for (auto &kv : players) {
@@ -557,17 +560,14 @@ struct ServerApp {
 		int caught_up = 0;
 		while ((int32_t)(now - next_tick) >= 0 && caught_up++ < 5) {
 			game_tick(now);
-			std::vector<int32_t> ids;
 			for (auto it = peers.begin(); it != peers.end();) {
 				const int32_t id = it->first;
 				++it;
 				if (now - peers[id].last_heard > TIMEOUT_MS) {
 					drop_peer(id, "timed out");
-				} else {
-					ids.push_back(id);
 				}
 			}
-			server.tick(now, ids, *this);
+			server.tick(now, *this);
 			next_tick = start_ms + (uint32_t)((uint64_t)++ticks * 1000 / TICK_HZ);
 		}
 		if ((int32_t)(now - next_tick) > 100) { // far behind (a debugger, a stall): don't spin to catch up
@@ -579,8 +579,9 @@ struct ServerApp {
 					blocks.size(), bytes_out / 1024.0);
 			for (auto &kv : peers) {
 				const SPlayer *p = players.count(kv.second.player) ? &players[kv.second.player] : nullptr;
+				const GServer::PeerStats st = server.peer_stats(kv.first);
 				printf("[server]   peer %d: %u commands/s, update rate %u, %u given up on\n", kv.first,
-						p ? p->commands : 0, server.update_rate(kv.first), server.skipped_commands(kv.first));
+						p ? p->commands : 0, st.update_rate, st.commands_skipped);
 			}
 			for (auto &kv : players) {
 				kv.second.commands = 0;
