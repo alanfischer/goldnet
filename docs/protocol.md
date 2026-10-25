@@ -81,8 +81,15 @@ channel part and the four counts) is `SNAPSHOT_HEADER_BYTES` = 32.
 uvarint net_id           the new entity
 uvarint spawner_net_id   the spawner that creates it; 0 if none
 uvarint len
-len bytes             spawn data, opaque to the protocol (Godot: var_to_bytes of the spawn's data)
+len bytes             spawn data, opaque to the protocol
 ```
+
+goldnet-godot hands out its net_ids on the server, from 1, and tells clients what they name with
+spawn entries. One with a spawner is a spawn: its data is `uvarint n`, the `n` net_ids of the
+synchronizers the spawned node brings (depth first, as both ends find them in the built node), then
+`var_to_bytes` of the spawn's data. One with spawner 0 is a *bind*: its data is the UTF-8 path of a
+node both ends already have (a synchronizer or a spawner placed in the scene), which the client
+binds to the net_id; its despawn unbinds it.
 
 **Despawn** and **leave** entries are a bare `uvarint net_id`. A despawn destroys the entity; a leave
 (sent unless the server turns relevance events off) says it dropped out of the peer's PVS. At most
