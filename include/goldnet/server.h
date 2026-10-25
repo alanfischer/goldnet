@@ -856,9 +856,9 @@ void Server<V, X>::tick(Host &p_host, uint32_t p_now) {
 			if (!owe_include(pr.spawn_wait, kv.first, seq, p_now, overdue, RELIABLE_BACKUP)) {
 				continue;
 			}
-			spawn_body_.put_u32(kv.first);
-			spawn_body_.put_u32(kv.second.spawner_net_id);
-			spawn_body_.put_u32((uint32_t)kv.second.data.size());
+			put_uvarint(&spawn_body_, kv.first);
+			put_uvarint(&spawn_body_, kv.second.spawner_net_id);
+			put_uvarint(&spawn_body_, (uint32_t)kv.second.data.size());
 			spawn_body_.put_data(kv.second.data.data(), kv.second.data.size());
 			spawn_ct++;
 		}
@@ -874,7 +874,7 @@ void Server<V, X>::tick(Host &p_host, uint32_t p_now) {
 			if (!owe_include(pr.despawn_wait, kv.first, seq, p_now, overdue, RELIABLE_BACKUP)) {
 				continue; // not due again yet; on_ack drops the peer once it's proven delivered
 			}
-			despawn_body_.put_u32(kv.first);
+			put_uvarint(&despawn_body_, kv.first);
 			despawn_ct++;
 		}
 
@@ -990,7 +990,7 @@ void Server<V, X>::tick(Host &p_host, uint32_t p_now) {
 		if (relevance_events_) {
 			derive_leaves(pr.held, visible_, MAX_LEAVES_PER_SNAPSHOT, leaving_, carried_);
 			for (uint32_t id : leaving_) {
-				leave_body_.put_u32(id);
+				put_uvarint(&leave_body_, id);
 				leave_ct++;
 			}
 			// Told to drop them, so they leave this frame's baseline too — which is what makes a
@@ -1058,7 +1058,7 @@ void Server<V, X>::tick(Host &p_host, uint32_t p_now) {
 					p_host.encode(slot_bytes_, e, (int)s, from_base ? value_at(e, (int)s, base_ctr) : nullptr, p_now);
 				}
 			}
-			body_.put_u32(c.net_id);
+			put_uvarint(&body_, c.net_id); // a host with small net_ids pays a byte or two, not four
 			put_uvarint(&body_, c.mask); // most entities set only the low few bits — 1 byte, not 4
 			put_uvarint(&body_, (uint32_t)(slot_bytes_.size() << 1) | (c.whole ? 1u : 0u));
 			if (c.whole) {

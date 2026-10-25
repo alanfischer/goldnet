@@ -1058,26 +1058,39 @@ static void test_carried_leave_reenters_whole() {
 	printf("  a leave held back by the cap re-enters whole: ok\n");
 }
 
-// Many entities, registered out of net_id order, under loss, PVS churn, a byte budget and a leave
-// cap that both overflow: once the link is clean and the world still, every peer holds every
-// visible entity's latest value.
+// Many entities, registered out of net_id order and replaced now and then, under loss, PVS churn, a byte budget and a leave cap that both overflow: once the
+// link is clean and the world still, every peer holds every visible entity's latest value.
 static void test_soak_converges() {
 	Net n;
 	Peer &a = n.add_peer(2);
 	Peer &b = n.add_peer(3);
 	const int count = 300;
-	for (int i = 0; i < count; i++) {
-		n.world.ents[10 + i].priority = 1.0f + (float)(i % 3);
-		n.add_entity(10 + i, 1000 + (uint32_t)(i * 7 % count), { 0, 0 });
-	}
 	uint32_t rng = sim_rng_seed(12345);
 	auto roll = [&](int p_n) { return (int)(xorshift32(rng) % (uint32_t)p_n); };
+	std::vector<uint64_t> keys(count);   // what's at each place now
+	std::vector<uint32_t> net_ids(count);
+	std::set<uint32_t> used;
+	auto add = [&](int p_i, uint64_t p_key) {
+		uint32_t id;
+		do {
+			id = xorshift32(rng); // hash-like, as goldnet-godot's are
+		} while (used.count(id));
+		used.insert(id);
+		keys[p_i] = p_key;
+		net_ids[p_i] = id;
+		n.world.ents[p_key].priority = 1.0f + (float)(p_i % 3);
+		n.add_entity(p_key, id, { roll(1000), roll(1000) });
+	};
+	for (int i = 0; i < count; i++) {
+		add(i, 10 + (uint64_t)i);
+	}
+	uint64_t next_key = 10000;
 	for (int t = 0; t < 600; t++) {
 		for (int k = 0; k < 40; k++) {
-			n.world.ents[10 + roll(count)].vals[roll(2)] = roll(1000) - 500;
+			n.world.ents[keys[roll(count)]].vals[roll(2)] = roll(1000) - 500;
 		}
 		for (int k = 0; k < 4; k++) {
-			WorldEnt &w = n.world.ents[10 + roll(count)];
+			WorldEnt &w = n.world.ents[keys[roll(count)]];
 			const int how = roll(4);
 			w.hidden = how == 0;
 			w.visible_to.clear();
@@ -1087,9 +1100,15 @@ static void test_soak_converges() {
 				w.visible_to.insert(3);
 			}
 		}
+		if (roll(4) == 0) {
+			const int at = roll(count); // replaced by a new entity
+			n.server.remove_entity(net_ids[at]);
+			n.world.ents.erase(keys[at]);
+			add(at, next_key++);
+		}
 		if (t % 150 == 75) {
 			for (int k = 0; k < 100; k++) {
-				n.world.ents[10 + k + (t % 2) * 100].hidden = true; // more leaves than a snapshot carries
+				n.world.ents[keys[k + (t % 2) * 100]].hidden = true; // more leaves than a snapshot carries
 			}
 		}
 		n.drop_snapshots.clear();
@@ -1112,16 +1131,15 @@ static void test_soak_converges() {
 	int checked = 0;
 	for (Peer *p : { &a, &b }) {
 		for (int i = 0; i < count; i++) {
-			if (!n.world.is_visible(10 + i, p->id)) {
+			if (!n.world.is_visible(keys[i], p->id)) {
 				continue;
 			}
-			const uint32_t id = 1000 + (uint32_t)(i * 7 % count);
-			CHECK(p->vals[id] == n.world.ents[10 + i].vals);
+			CHECK(p->vals[net_ids[i]] == n.world.ents[keys[i]].vals);
 			checked++;
 		}
 	}
 	CHECK(checked > count / 2);
-	printf("  a long lossy session with PVS churn converges (%d entities checked): ok\n", checked);
+	printf("  a long lossy session with PVS and entity churn converges (%d entities checked): ok\n", checked);
 }
 
 static void test_update_rate_throttles_one_peer() {
@@ -1212,6 +1230,23 @@ static void test_warmup_defer_then_accept() {
 // A slot goes as its change from the value the peer holds at its baseline, so the same state costs
 // less as a delta than whole. One that moved and came back while the baseline stood still still
 // goes: the client applied the move from a frame the server never heard was acked.
+// A net_id goes as a uvarint, so a host with small ones pays a byte where a hash pays five.
+static void test_net_ids_are_varints() {
+	Net n;
+	Peer &p = n.add_peer(2);
+	const uint32_t hashed = 0xDEADBEEFu;
+	n.add_entity(10, 100, { 1 });
+	n.add_entity(11, hashed, { 1 });
+	n.tick();
+	n.world.ents[10].vals[0] = 2;
+	n.tick();
+	CHECK(entity_bytes(n.last_packet(2)) == 1 + 1 + 1 + 1); // net_id, head, length, value
+	n.world.ents[11].vals[0] = 2;
+	n.tick();
+	CHECK(entity_bytes(n.last_packet(2)) == 5 + 1 + 1 + 1 && p.vals[hashed][0] == 2 && p.vals[100][0] == 2);
+	printf("  net_ids go as varints: ok\n");
+}
+
 static void test_slots_go_as_changes() {
 	Net n;
 	Peer &p = n.add_peer(2);
@@ -1221,8 +1256,8 @@ static void test_slots_go_as_changes() {
 	n.server.mark_dirty(100);
 	n.tick();
 	CHECK(p.vals[100][0] == 1000001);
-	// net_id 4, head 1, length 1, and a step of +1 in one byte.
-	CHECK(entity_bytes(n.last_packet(2)) == 7);
+	// net_id 1 (a varint of 100), head 1, length 1, and a step of +1 in one byte.
+	CHECK(entity_bytes(n.last_packet(2)) == 4);
 	n.drop_acks.insert(2); // the peer's baseline stays put while the slot moves and returns
 	n.world.ents[10].vals[1] = 6;
 	n.server.mark_dirty(100);
@@ -1340,7 +1375,7 @@ static void test_rate_chokes_to_the_budget() {
 	Net n;
 	n.add_peer(2);
 	Peer &slow = n.add_peer(3);
-	for (int i = 0; i < 10; i++) {
+	for (int i = 0; i < 20; i++) {
 		n.add_entity(10 + i, 100 + i, { 0, 0 });
 	}
 	slow.client.set_rate(2000); // bytes per second
@@ -1348,7 +1383,7 @@ static void test_rate_chokes_to_the_budget() {
 	size_t fast_bytes = 0, slow_bytes = 0;
 	int fast_packets = 0, slow_packets = 0;
 	for (int t = 0; t < 125; t++) { // 2 s
-		for (int i = 0; i < 10; i++) {
+		for (int i = 0; i < 20; i++) {
 			n.world.ents[10 + i].vals[0] = t; // everything moves every tick
 		}
 		n.tick();
@@ -1716,6 +1751,7 @@ int main() {
 	test_push_declared_slots_skip_reads();
 	test_warmup_defer_then_accept();
 	test_slots_go_as_changes();
+	test_net_ids_are_varints();
 	test_aged_history_goes_whole();
 	test_kinds_mismatch_refuses_entity();
 	test_removed_entity_leaves_client_frame();
