@@ -295,12 +295,12 @@ static void test_malformed_input() {
 	CommandReceiver r;
 	RecvHost h;
 	for (size_t cut = 0; cut < w.size(); cut++) {
-		CHECK(!r.receive(2, w.data(), cut, h, 0)); // every truncation is refused
+		CHECK(r.receive(2, w.data(), cut, h, 0).status == STATUS_MALFORMED); // every truncation is refused
 	}
 	CHECK(h.got.empty() && h.snapshot_acks.empty());
 	std::vector<uint8_t> bad(w.data(), w.data() + w.size());
 	bad[0] = WIRE_VERSION + 1;
-	CHECK(!r.receive(3, bad.data(), bad.size(), h, 0));
+	CHECK(r.receive(3, bad.data(), bad.size(), h, 0).status == STATUS_MISMATCH);
 	CHECK(!r.receive(3, bad.data(), bad.size(), h, 0));
 	CHECK(h.mismatches == 1);
 	CHECK(r.receive(2, w.data(), w.size(), h, 0) && h.got.size() == 2);

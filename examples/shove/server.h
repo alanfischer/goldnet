@@ -48,7 +48,7 @@ inline const std::vector<uint8_t> &block_quant() {
 	return q;
 }
 
-struct ServerApp {
+struct ServerApp : goldnet::ServerHost<Value> {
 	struct Outgoing {
 		std::string to;
 		std::vector<uint8_t> bytes;
@@ -96,10 +96,10 @@ struct ServerApp {
 	int bots_wanted = 0;
 	bool verbose = true;
 
-	// --- goldnet's host interface (Server::tick) ---
+	// --- goldnet's host interface (ServerHost): everything is visible to everyone, and the one
+	// command stream is a byte string, so the defaults cover the rest ---
 
-	bool live(GServer::Entity &e) { return players.count(e.net_id()) || blocks.count(e.net_id()); }
-	EntityLayout prepare(GServer::Entity &e) {
+	EntityLayout prepare(GServer::Entity &e) override {
 		EntityLayout l;
 		if (players.count(e.net_id())) {
 			l.slots = PLAYER_SLOTS;
@@ -109,7 +109,7 @@ struct ServerApp {
 		}
 		return l;
 	}
-	void read(GServer::Entity &e, bool) {
+	void read(GServer::Entity &e, bool) override {
 		auto pit = players.find(e.net_id());
 		if (pit != players.end()) {
 			const SPlayer &p = pit->second;
@@ -134,13 +134,11 @@ struct ServerApp {
 			server.stamp(e, s, Value(v[s]));
 		}
 	}
-	bool visible(const GServer::Entity &, int32_t) { return true; }
-	bool spawn_visible(uint64_t, int32_t) { return true; }
 	// Every value whole and self-tagged: simple, and right against any base.
-	void encode(Writer &w, const GServer::Entity &e, int slot, const Value *, uint32_t) {
+	void encode(Writer &w, const GServer::Entity &e, int slot, const Value *, uint32_t) override {
 		encode_value(w, e.value(slot), (players.count(e.net_id()) ? player_quant() : block_quant())[slot]);
 	}
-	void send(int32_t peer, const Writer &packet) {
+	void send(int32_t peer, const Writer &packet) override {
 		Outgoing o{ peers[peer].addr, std::vector<uint8_t>(packet.data(), packet.data() + packet.size()) };
 		bytes_out += o.bytes.size();
 		if (netsim.loss_roll()) {
@@ -155,15 +153,10 @@ struct ServerApp {
 		}
 	}
 
-	// --- goldnet's host interface (Server::receive_uplink) ---
-
-	void protocol_mismatch(int32_t peer) { fprintf(stderr, "[server] peer %d speaks a different version\n", peer); }
-	void message(int32_t, const uint8_t *, size_t, bool) {}
-	const goldnet::Schema *command_schema(int32_t, uint32_t) {
-		static const goldnet::Schema bytes_only{ goldnet::FIELD_BYTES };
-		return &bytes_only;
+	void protocol_mismatch(int32_t peer) override {
+		fprintf(stderr, "[server] peer %d speaks a different version\n", peer);
 	}
-	void command(int32_t peer, uint32_t, const goldnet::Command &c) {
+	void command(int32_t peer, uint32_t, const goldnet::Command &c) override {
 		auto it = players.find(peers[peer].player);
 		Input in;
 		if (it == players.end() || !read_input(c[0].bytes.data(), c[0].bytes.size(), in)) {

@@ -14,6 +14,10 @@
 // receive_uplink() and the netchan take only theirs. A packet from any other peer is dropped. Add
 // and remove peers between ticks, never from inside the host's callbacks.
 //
+// The host. tick() and receive_uplink() call back into an object the game passes them, with the methods
+// listed below. Deriving it from ServerHost (at the end of this file) leaves only prepare, read, encode
+// and send to write; the rest default to a game that doesn't use them.
+//
 // The host passed to tick() provides:
 //   bool live(Entity &e)                        is the entity replicating this tick? (may refresh e.user)
 //   EntityLayout prepare(Entity &e)             first live tick: how its slots replicate (EntityLayout)
@@ -367,10 +371,15 @@ public:
 
 	// One uplink packet from p_peer: its commands and messages go to p_host, its snapshot and channel
 	// acks to this server, and the peer's next header gets the command ack, the uplink ack and the
-	// uplink report. The rate and update rate it asks for apply from here on. False if the packet was
-	// malformed, from a mismatched build, or from a peer not added (which is dropped untouched).
+	// uplink report. The rate and update rate it asks for apply from here on. False, with the reason,
+	// if the packet was malformed, from a mismatched build, or from a peer not added (which is
+	// dropped untouched).
 	template <class Host>
-	bool receive_uplink(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now);
+	Result receive_uplink(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host, uint32_t p_now);
+
+	// A command stream's field kinds, as the client's Client::set_command_schema names them. The
+	// uplink reads a stream set here by it, and asks the host's command_schema() for any other.
+	void set_command_schema(uint32_t p_stream, const Schema &p_schema) { schemas_[p_stream] = p_schema; }
 
 	// --- Messages (netchan.h) ---
 
@@ -558,6 +567,7 @@ private:
 	std::unordered_map<int32_t, PeerRing> rings_;
 	std::vector<int32_t> peers_; // rings_'s keys, in the order add_peer() added them
 	CommandReceiver uplink_;
+	std::unordered_map<uint32_t, Schema> schemas_; // set_command_schema's
 	// Monotonic snapshot counter, bumped once per tick that sends anything. It stamps
 	// Entity::slot_ctr_ and PeerRing::frame_ctr so change tests are a single integer compare. Unlike
 	// the 16-bit wire seq it never wraps in any realistic session (2^32 ticks at 60 Hz is ~2 years).
@@ -595,11 +605,11 @@ private:
 
 template <class V, class X>
 template <class Host>
-bool Server<V, X>::receive_uplink(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host,
+Result Server<V, X>::receive_uplink(int32_t p_peer, const uint8_t *p_data, size_t p_size, Host &p_host,
 		uint32_t p_now) {
 	auto rit = rings_.find(p_peer);
 	if (rit == rings_.end()) {
-		return false;
+		return { STATUS_UNKNOWN_PEER };
 	}
 	struct Router {
 		Server &server;
@@ -608,12 +618,15 @@ bool Server<V, X>::receive_uplink(int32_t p_peer, const uint8_t *p_data, size_t 
 		void protocol_mismatch(int32_t p) { host.protocol_mismatch(p); }
 		void snapshot_ack(int32_t p, uint16_t seq) { server.on_ack(p, seq, now); }
 		void channel_ack(int32_t p, const ChannelAck &a) { server.on_channel_ack(p, a); }
-		const Schema *command_schema(int32_t p, uint32_t stream) { return host.command_schema(p, stream); }
+		const Schema *command_schema(int32_t p, uint32_t stream) {
+			auto it = server.schemas_.find(stream);
+			return it != server.schemas_.end() ? &it->second : host.command_schema(p, stream);
+		}
 		void command(int32_t p, uint32_t stream, const Command &c) { host.command(p, stream, c); }
 		void message(int32_t p, const uint8_t *d, size_t n, bool reliable) { host.message(p, d, n, reliable); }
 	};
 	Router router{ *this, p_host, p_now };
-	const bool ok = uplink_.receive(p_peer, p_data, p_size, router, p_now);
+	const Result res = uplink_.receive(p_peer, p_data, p_size, router, p_now);
 	PeerRing &pr = rit->second;
 	pr.cmd_ack = uplink_.ack(p_peer);
 	pr.cmd_news = pr.cmd_news || uplink_.take_news(p_peer);
@@ -623,7 +636,7 @@ bool Server<V, X>::receive_uplink(int32_t p_peer, const uint8_t *p_data, size_t 
 	const uint32_t rate = uplink_.rate(p_peer);
 	pr.rate_bps = rate > 0 && rate < MIN_RATE ? MIN_RATE : rate;
 	pr.update_rate_asked = uplink_.update_rate(p_peer);
-	return ok;
+	return res;
 }
 
 template <class V, class X>
@@ -984,5 +997,37 @@ void Server<V, X>::tick(uint32_t p_now, Host &p_host) {
 		charge(peer, p_now, packet.size() + (size_t)packet_overhead_);
 	}
 }
+
+// A base for the host Server::tick and Server::receive_uplink call back into, one object for both:
+// derive from it and define prepare, read, encode and send, which it leaves pure. Everything else has
+// a default that suits a game not using the feature, so define only what you use, marked override
+// so a misspelt name fails to compile rather than quietly keeping the default. A host needn't derive
+// from it at all: the server calls whatever the object it's handed has, and this only supplies the rest.
+template <class V, class X = NoUserData>
+struct ServerHost {
+	typedef typename Server<V, X>::Entity Entity;
+
+	virtual ~ServerHost() = default;
+
+	virtual EntityLayout prepare(Entity &e) = 0;
+	virtual void read(Entity &e, bool polled_only) = 0;
+	virtual void encode(Writer &w, const Entity &e, int slot, const V *base, uint32_t now_ms) = 0;
+	virtual void send(int32_t peer, const Writer &packet) = 0;
+
+	// Every entity added replicates, to every peer.
+	virtual bool live(Entity &) { return true; }
+	virtual bool visible(const Entity &, int32_t) { return true; }
+	virtual bool spawn_visible(uint64_t, int32_t) { return true; }
+
+	// The uplink: no commands or messages taken, and a stream with no schema set on the server
+	// (Server::set_command_schema) is one FIELD_BYTES field, as it is on the client.
+	virtual void protocol_mismatch(int32_t) {}
+	virtual const Schema *command_schema(int32_t, uint32_t) {
+		static const Schema bytes_only{ FIELD_BYTES };
+		return &bytes_only;
+	}
+	virtual void command(int32_t, uint32_t, const Command &) {}
+	virtual void message(int32_t, const uint8_t *, size_t, bool) {}
+};
 
 } // namespace goldnet

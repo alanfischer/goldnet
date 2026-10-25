@@ -16,7 +16,10 @@
 // The rate and the command rate can each be picked automatically instead (auto_rate.h): the rate
 // from how far behind the downlink arrives, the command rate from the server's report of the uplink.
 //
-// The host passed to apply() provides:
+// The host passed to apply() provides the following. Deriving it from ClientHost (at the end of this
+// file) leaves only registered, begin_entity, decode and set_slot to write; the rest default to a
+// game that doesn't use them.
+//
 //   void protocol_mismatch()                       a different build is talking to us (once per session)
 //   void server_time(uint32_t ms)                  every in-order snapshot's header clock, before
 //                                                  any of its values are applied
@@ -58,8 +61,10 @@ namespace goldnet {
 template <class V>
 class Client {
 public:
-	// What the last apply() saw, for a host's debug print.
+	// What apply() made of a snapshot: why it wasn't taken, if it wasn't, and what it saw, for a
+	// host's debug print.
 	struct ApplyInfo {
+		Status status = STATUS_OK;
 		uint16_t seq = 0;
 		uint16_t base_seq = 0;
 		int spawns = 0;
@@ -295,11 +300,17 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 
 	// Protocol guard: a mismatched build (different wire format) would misparse every field. Fail
 	// loudly once and drop, rather than flooding the log with decode errors.
-	if (r.get_u8() != WIRE_VERSION) {
+	const uint8_t version = r.get_u8();
+	if (r.failed()) {
+		info.status = STATUS_MALFORMED;
+		return info;
+	}
+	if (version != WIRE_VERSION) {
 		if (!warned_mismatch_) {
 			warned_mismatch_ = true;
 			p_host.protocol_mismatch();
 		}
+		info.status = STATUS_MISMATCH;
 		return info;
 	}
 
@@ -315,6 +326,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	info.seq = seq;
 	info.base_seq = base_seq;
 	if (r.failed()) {
+		info.status = STATUS_MALFORMED;
 		return info;
 	}
 	count_arrival(seq);
@@ -323,6 +335,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	// newer than the last committed one but not the last received is stale too: GoldSrc drops any
 	// packet older than the newest, and its messages must never play after a newer packet's.
 	if ((has_ && !seq_newer(seq, last_seq_)) || !chan_.accept(seq)) {
+		info.status = STATUS_STALE;
 		return info;
 	}
 	uplink_.on_channel_ack(chan.ack, p_now);
@@ -330,6 +343,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	std::vector<std::vector<uint8_t>> reliable;
 	std::vector<std::vector<uint8_t>> unreliable;
 	if (!chan.take(chan_, p_now, reliable, unreliable)) {
+		info.status = STATUS_MALFORMED;
 		return info;
 	}
 	auto deliver = [&p_host](std::vector<std::vector<uint8_t>> &p_msgs, bool p_reliable) {
@@ -363,6 +377,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 			if (has_) {
 				queue_ack(last_seq_, info);
 			}
+			info.status = STATUS_NO_BASELINE;
 			return info;
 		}
 	}
@@ -480,6 +495,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	// A truncated or corrupt packet: whatever it applied stays applied (later snapshots carry the
 	// same state again), but it is not a frame we can baseline against, so don't commit or ack it.
 	if (r.failed()) {
+		info.status = STATUS_MALFORMED;
 		return info;
 	}
 
@@ -522,6 +538,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 		if (has_) {
 			queue_ack(last_seq_, info);
 		}
+		info.status = STATUS_HELD;
 		return info;
 	}
 	defer_streak_ = 0;
@@ -573,5 +590,27 @@ void Client<V>::count_arrival(uint16_t p_seq) {
 		arrivals_.lost--; // late, not lost
 	}
 }
+
+// A base for the host Client::apply calls back into: derive from it and define registered,
+// begin_entity, decode and set_slot, which it leaves pure. Everything else has a default that suits a
+// game not using the feature, so define only what you use, marked override (see ServerHost).
+template <class V>
+struct ClientHost {
+	virtual ~ClientHost() = default;
+
+	virtual bool registered(uint32_t net_id) = 0;
+	virtual int begin_entity(uint32_t net_id, uint32_t mask, bool whole, uint8_t kinds_check, bool &r_defer) = 0;
+	virtual V decode(Reader &r, int slot, const V *base, uint32_t ref_time_ms) = 0;
+	virtual bool set_slot(int slot, const V &v) = 0;
+	virtual void end_entity(bool) {}
+
+	// A spawn is taken, and creates nothing: a game with no runtime entities never gets one.
+	virtual bool spawn(uint32_t, uint32_t, const uint8_t *, size_t) { return true; }
+	virtual void despawn(uint32_t) {}
+	virtual void relevance_lost(uint32_t) {}
+	virtual void server_time(uint32_t) {}
+	virtual void message(const uint8_t *, size_t, bool) {}
+	virtual void protocol_mismatch() {}
+};
 
 } // namespace goldnet

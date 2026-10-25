@@ -80,6 +80,45 @@ struct TestServerHost {
 	}
 };
 
+// --- a game that takes the defaults: hosts derived from ServerHost and ClientHost ---
+
+// One entity's slots as whole ints, and the commands that arrive. Nothing else is defined.
+struct MinimalServerHost : ServerHost<Val> {
+	TestServer *server = nullptr;
+	std::vector<Val> vals;
+	std::vector<std::vector<uint8_t>> sent;
+	std::vector<Command> commands;
+
+	EntityLayout prepare(Entity &) override {
+		EntityLayout l;
+		l.slots = (int)vals.size();
+		return l;
+	}
+	void read(Entity &e, bool) override {
+		for (int s = 0; s < e.slots(); s++) {
+			server->stamp(e, s, vals[s]);
+		}
+	}
+	void encode(Writer &w, const Entity &e, int slot, const Val *, uint32_t) override { put_varint(&w, e.value(slot)); }
+	void send(int32_t, const Writer &w) override { sent.emplace_back(w.data(), w.data() + w.size()); }
+	void command(int32_t, uint32_t, const Command &c) override { commands.push_back(c); }
+};
+
+// Net id 100, with the slots MinimalServerHost sends.
+struct MinimalClientHost : ClientHost<Val> {
+	std::vector<Val> vals;
+
+	bool registered(uint32_t net_id) override { return net_id == 100; }
+	int begin_entity(uint32_t net_id, uint32_t, bool, uint8_t, bool &) override {
+		return net_id == 100 ? (int)vals.size() : -1;
+	}
+	Val decode(Reader &r, int, const Val *, uint32_t) override { return get_varint(&r); }
+	bool set_slot(int s, const Val &v) override {
+		vals[s] = v;
+		return true;
+	}
+};
+
 // --- one client: what it has applied, and what it acked ---
 
 struct Peer {
@@ -91,6 +130,7 @@ struct Peer {
 	std::map<uint32_t, int> synced;           // net_id -> times `synchronized` fired
 	std::vector<uint32_t> spawned, despawned, lost;
 	std::vector<uint16_t> acks;
+	std::vector<Status> statuses; // of every snapshot delivered, in order
 	std::vector<uint32_t> times;
 	std::vector<std::pair<std::vector<uint8_t>, bool>> messages; // bytes, reliable
 	std::vector<std::string> events; // spawns, messages and despawns, in the order the host saw them
@@ -208,6 +248,7 @@ struct Net {
 				}
 				TestClientHost ch{ &p };
 				const Client<Val>::ApplyInfo info = p.client.apply(pkt.data(), pkt.size(), ch, now);
+				p.statuses.push_back(info.status);
 				if (info.ack) {
 					p.acks.push_back(info.ack);
 				}
@@ -223,7 +264,7 @@ struct Net {
 	}
 
 	// The client's next uplink packet, now, delivered whatever drop_acks says.
-	bool send_uplink(Peer &p) {
+	Result send_uplink(Peer &p) {
 		Writer w;
 		p.client.write_uplink(now, w);
 		return server.receive_uplink(p.id, w.data(), w.size(), uplink_host, now);
@@ -265,6 +306,7 @@ static void test_baseline_then_delta() {
 	n.add_entity(10, 100, { 1, 2, 3 });
 	n.tick();
 	CHECK(p.vals[100] == (std::vector<Val>{ 1, 2, 3 }));
+	CHECK(p.statuses == std::vector<Status>{ STATUS_OK });
 	CHECK(base_seq_of(n.last_packet(2)) == 0); // first send is a full frame
 	size_t full = n.last_packet(2).size();
 
@@ -356,6 +398,7 @@ static void test_unknown_baseline_is_dropped() {
 	n.drop_acks.insert(2);
 	n.tick();
 	CHECK(p.vals[100][0] == 1); // dropped, not misapplied
+	CHECK(p.statuses.back() == STATUS_NO_BASELINE);
 	printf("  delta against an unknown baseline is dropped: ok\n");
 }
 
@@ -368,7 +411,7 @@ static void test_reordered_snapshot_is_dropped() {
 	n.world.ents[10].vals[0] = 2;
 	n.tick();
 	TestClientHost ch{ &p };
-	p.client.apply(old_pkt.data(), old_pkt.size(), ch, n.now);
+	CHECK(p.client.apply(old_pkt.data(), old_pkt.size(), ch, n.now).status == STATUS_STALE);
 	CHECK(p.vals[100][0] == 2);
 	printf("  reordered snapshot is dropped: ok\n");
 }
@@ -386,6 +429,7 @@ static void test_truncated_packet_not_committed() {
 	Client<Val>::ApplyInfo info = p.client.apply(pkt.data(), pkt.size() - 1, ch, n.now);
 	CHECK(!info.committed);
 	CHECK(info.ack == 0);
+	CHECK(info.status == STATUS_MALFORMED);
 	printf("  truncated packet is not committed or acked: ok\n");
 }
 
@@ -393,8 +437,11 @@ static void test_protocol_mismatch_warns_once() {
 	Peer p;
 	uint8_t bad[] = { (uint8_t)(WIRE_VERSION + 1), 0, 0, 0, 0 };
 	TestClientHost ch{ &p };
-	CHECK(p.client.apply(bad, sizeof(bad), ch, 0).ack == 0);
+	const Client<Val>::ApplyInfo info = p.client.apply(bad, sizeof(bad), ch, 0);
+	CHECK(info.ack == 0 && info.status == STATUS_MISMATCH);
 	p.client.apply(bad, sizeof(bad), ch, 0);
+	CHECK(p.mismatches == 1);
+	CHECK(p.client.apply(bad, 0, ch, 0).status == STATUS_MALFORMED); // empty: no version to mismatch
 	CHECK(p.mismatches == 1);
 	CHECK(!p.client.uplink_due(0));
 	printf("  protocol mismatch warns once: ok\n");
@@ -485,6 +532,7 @@ static void test_refused_spawn_holds_ack() {
 		n.tick();
 	}
 	CHECK(a.spawned == std::vector<uint32_t>{ 500 });
+	CHECK(a.statuses.front() == STATUS_HELD && a.statuses.back() == STATUS_OK);
 	n.tick();
 	n.tick();
 	CHECK(a.spawned.size() == 1);
@@ -1198,7 +1246,7 @@ static void test_only_added_peers_are_served() {
 	CHECK(!n.server.has_peer(2) && n.server.peers().empty());
 	const uint8_t cmd[1] = { 7 };
 	a.client.push_command(1, cmd, sizeof(cmd), n.now);
-	CHECK(!n.send_uplink(a)); // a late packet from it goes nowhere
+	CHECK(n.send_uplink(a).status == STATUS_UNKNOWN_PEER); // a late packet from it goes nowhere
 	CHECK(n.uplink_host.commands.empty());
 	CHECK(!n.server.queue_reliable(2, cmd, 1) && !n.server.queue_unreliable(2, cmd, 1));
 	CHECK(!n.server.has_peer(2) && n.server.peer_stats(2).messages_queued == 0);
@@ -1212,6 +1260,48 @@ static void test_only_added_peers_are_served() {
 	n.tick();
 	CHECK(n.sent_to(2) == 1 && base_seq_of(n.last_packet(2)) == 0);
 	printf("  only the peers added are served, and a removed one stays removed: ok\n");
+}
+
+// A host derived from ServerHost or ClientHost defines only what its game uses: here no visibility,
+// spawns, messages or command_schema. A stream the server was given with set_command_schema is read
+// by it, and one set on neither end is a byte string on both.
+static void test_default_hosts() {
+	TestServer server;
+	MinimalServerHost sh;
+	sh.server = &server;
+	sh.vals = { 4, 5 };
+	server.add_peer(2);
+	server.add_entity(10, 100);
+	const Schema schema{ FIELD_INT, FIELD_BOOL };
+	server.set_command_schema(9, schema);
+	Client<Val> client;
+	client.set_command_schema(9, schema);
+	MinimalClientHost ch;
+	ch.vals.resize(2);
+
+	server.tick(1000, sh);
+	CHECK(sh.sent.size() == 1);
+	CHECK(client.apply(sh.sent.back().data(), sh.sent.back().size(), ch, 1000).status == STATUS_OK);
+	CHECK((ch.vals == std::vector<Val>{ 4, 5 }));
+
+	Command cmd(2);
+	cmd[0].i = -3;
+	cmd[1].i = 1;
+	client.push_command(9, cmd, 1000);
+	const uint8_t bytes[2] = { 7, 8 };
+	client.push_command(4, bytes, sizeof(bytes), 1000);
+	Writer w;
+	client.write_uplink(1000, w);
+	CHECK(server.receive_uplink(2, w.data(), w.size(), sh, 1000));
+	CHECK(sh.commands.size() == 2 && sh.commands[0][0].i == -3 && sh.commands[0][1].i == 1);
+	CHECK(sh.commands.size() == 2 && sh.commands[1][0].bytes == std::vector<uint8_t>(bytes, bytes + 2));
+
+	sh.vals[1] = 6;
+	server.tick(1016, sh);
+	CHECK(sh.sent.size() == 2 && base_seq_of(sh.sent.back()) != 0); // a delta against the acked frame
+	CHECK(client.apply(sh.sent.back().data(), sh.sent.back().size(), ch, 1016).status == STATUS_OK);
+	CHECK((ch.vals == std::vector<Val>{ 4, 6 }));
+	printf("  hosts derived from ServerHost and ClientHost define only what they use: ok\n");
 }
 
 int main() {
@@ -1258,6 +1348,7 @@ int main() {
 	test_messages_ride_the_snapshot_in_order();
 	test_messages_survive_a_lost_snapshot();
 	test_only_added_peers_are_served();
+	test_default_hosts();
 	printf("%d checks passed\n", checks);
 	return 0;
 }

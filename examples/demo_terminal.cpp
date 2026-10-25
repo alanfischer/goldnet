@@ -144,7 +144,7 @@ struct Outgoing {
 
 typedef Server<Value> DemoServer;
 
-struct ServerApp {
+struct ServerApp : ServerHost<Value> {
 	int fd = -1;
 	DemoServer server;
 	NetSim<Outgoing> sim;
@@ -167,14 +167,15 @@ struct ServerApp {
 	size_t bytes_out = 0;
 	int packets_out = 0;
 
-	// The host interface Server::tick() calls back into.
-	bool live(DemoServer::Entity &e) { return e.key() == SCOREBOARD_ID || balls.count(e.key()); }
-	EntityLayout prepare(DemoServer::Entity &e) {
+	// The host interface Server::tick() and Server::receive_uplink() call back into (ServerHost).
+	// Everything is visible to everyone, and the one command stream is a byte string, so the
+	// defaults cover the rest.
+	EntityLayout prepare(DemoServer::Entity &e) override {
 		EntityLayout l;
 		l.slots = e.key() == SCOREBOARD_ID ? 2 : BALL_SLOTS; // the scoreboard: live balls, total bounces
 		return l;
 	}
-	void read(DemoServer::Entity &e, bool) {
+	void read(DemoServer::Entity &e, bool) override {
 		if (e.key() == SCOREBOARD_ID) {
 			server.stamp(e, 0, Value((int64_t)balls.size()));
 			server.stamp(e, 1, Value(total_bounces));
@@ -186,13 +187,11 @@ struct ServerApp {
 		server.stamp(e, 2, Value(atan2f(b.vy, b.vx)));
 		server.stamp(e, 3, Value(b.bounces));
 	}
-	bool visible(const DemoServer::Entity &, int32_t) { return true; }
-	bool spawn_visible(uint64_t, int32_t) { return true; }
 	// Every value whole and self-tagged: simple, and right against any base.
-	void encode(Writer &w, const DemoServer::Entity &e, int slot, const Value *, uint32_t now) {
+	void encode(Writer &w, const DemoServer::Entity &e, int slot, const Value *, uint32_t now) override {
 		encode_value(w, e.value(slot), e.key() == SCOREBOARD_ID ? QUANT_AUTO : BALL_QUANT[slot], now);
 	}
-	void send(int32_t peer, const Writer &packet) {
+	void send(int32_t peer, const Writer &packet) override {
 		Outgoing o{ peers[peer].addr, std::vector<uint8_t>(packet.data(), packet.data() + packet.size()) };
 		bytes_out += o.bytes.size();
 		packets_out++;
@@ -210,14 +209,10 @@ struct ServerApp {
 		}
 	}
 
-	// The host interface Server::receive_uplink() calls back into.
-	void protocol_mismatch(int32_t peer) { fprintf(stderr, "[server] peer %d speaks a different version\n", peer); }
-	void message(int32_t, const uint8_t *, size_t, bool) {}
-	const Schema *command_schema(int32_t, uint32_t) {
-		static const Schema bytes_only{ FIELD_BYTES };
-		return &bytes_only;
+	void protocol_mismatch(int32_t peer) override {
+		fprintf(stderr, "[server] peer %d speaks a different version\n", peer);
 	}
-	void command(int32_t peer, uint32_t, const Command &c) {
+	void command(int32_t peer, uint32_t, const Command &c) override {
 		const uint8_t *data = c[0].bytes.data();
 		const size_t size = c[0].bytes.size();
 		PeerInfo &p = peers[peer];
@@ -369,7 +364,7 @@ struct ServerApp {
 
 // --- client ---
 
-struct ClientApp {
+struct ClientApp : ClientHost<Value> {
 	int fd = -1;
 	sockaddr_in server_addr = {};
 	Client<Value> client;
@@ -387,32 +382,29 @@ struct ClientApp {
 	int spawns = 0, despawns = 0, snapshots = 0, committed = 0;
 	size_t bytes_in = 0;
 
-	// The host interface Client::apply() calls back into.
-	void protocol_mismatch() { fprintf(stderr, "[client] server speaks a different snapshot version\n"); }
-	void server_time(uint32_t ms) { server_ms = ms; }
-	void message(const uint8_t *, size_t, bool) {}
-	bool spawn(uint32_t net_id, uint32_t, const uint8_t *data, size_t size) {
+	// The host interface Client::apply() calls back into (ClientHost).
+	void protocol_mismatch() override { fprintf(stderr, "[client] server speaks a different snapshot version\n"); }
+	void server_time(uint32_t ms) override { server_ms = ms; }
+	bool spawn(uint32_t net_id, uint32_t, const uint8_t *data, size_t size) override {
 		ents[net_id] = Ent{ size ? (char)data[0] : '?', std::vector<Value>(BALL_SLOTS) };
 		spawns++;
 		return true;
 	}
-	void despawn(uint32_t net_id) {
+	void despawn(uint32_t net_id) override {
 		ents.erase(net_id);
 		despawns++;
 	}
-	void relevance_lost(uint32_t) {}
-	bool registered(uint32_t net_id) { return ents.count(net_id) > 0; }
-	int begin_entity(uint32_t net_id, uint32_t, bool, uint8_t, bool &) {
+	bool registered(uint32_t net_id) override { return ents.count(net_id) > 0; }
+	int begin_entity(uint32_t net_id, uint32_t, bool, uint8_t, bool &) override {
 		cur = net_id;
 		auto it = ents.find(net_id);
 		return it == ents.end() ? -1 : (int)it->second.vals.size();
 	}
-	bool set_slot(int slot, const Value &v) {
+	bool set_slot(int slot, const Value &v) override {
 		ents[cur].vals[slot] = v;
 		return true;
 	}
-	void end_entity(bool) {}
-	Value decode(Reader &r, int, const Value *, uint32_t ref_time_ms) { return decode_value(r, ref_time_ms); }
+	Value decode(Reader &r, int, const Value *, uint32_t ref_time_ms) override { return decode_value(r, ref_time_ms); }
 
 	void transmit(const std::vector<uint8_t> &pkt) {
 		sendto(fd, pkt.data(), pkt.size(), 0, (sockaddr *)&server_addr, sizeof(server_addr));
