@@ -18,7 +18,7 @@ static void test_queue_steady_stream_reads_no_lag() {
 	QueueMeter m;
 	uint32_t lag = 0;
 	for (int seq = 1; seq < 300; seq++) {
-		lag = m.note(5000 + (uint32_t)(seq * TICK) + 40, (int64_t)(seq * TICK)); // a constant 40 ms trip
+		lag = m.note((int64_t)(seq * TICK), 5000 + (uint32_t)(seq * TICK) + 40); // a constant 40 ms trip
 	}
 	CHECK(lag <= 1);
 	printf("  a steady stream reads no lag: ok\n");
@@ -27,12 +27,12 @@ static void test_queue_steady_stream_reads_no_lag() {
 static void test_queue_building_reads_its_extra_wait() {
 	QueueMeter m;
 	for (int seq = 1; seq < 120; seq++) {
-		m.note(5000 + (uint32_t)(seq * TICK) + 40, (int64_t)(seq * TICK));
+		m.note((int64_t)(seq * TICK), 5000 + (uint32_t)(seq * TICK) + 40);
 	}
 	uint32_t lag = 0;
 	for (int k = 0; k < 60; k++) { // each packet now waits 5 ms longer than the last
 		const int seq = 120 + k;
-		lag = m.note(5000 + (uint32_t)(seq * TICK) + 40 + 5 * k, (int64_t)(seq * TICK));
+		lag = m.note((int64_t)(seq * TICK), 5000 + (uint32_t)(seq * TICK) + 40 + 5 * k);
 	}
 	CHECK(std::abs((int)lag - 295) <= 2);
 	printf("  a building queue reads as its extra wait (%u): ok\n", lag);
@@ -41,13 +41,13 @@ static void test_queue_building_reads_its_extra_wait() {
 static void test_queue_pause_is_not_lag() {
 	QueueMeter m;
 	for (int seq = 1; seq < 120; seq++) {
-		m.note(5000 + (uint32_t)(seq * TICK) + 40, (int64_t)(seq * TICK));
+		m.note((int64_t)(seq * TICK), 5000 + (uint32_t)(seq * TICK) + 40);
 	}
 	// Silent for 3 s, and the next packets are stamped as if no time had passed on the sender.
 	const uint32_t t0 = 5000 + (uint32_t)(120 * TICK) + 40 + 3000;
 	uint32_t lag = 0;
 	for (int k = 0; k < 30; k++) {
-		lag = m.note(t0 + (uint32_t)(k * TICK), (int64_t)((120 + k) * TICK));
+		lag = m.note((int64_t)((120 + k) * TICK), t0 + (uint32_t)(k * TICK));
 	}
 	CHECK(lag <= 1);
 	printf("  a pause starts the floor over: ok\n");
@@ -58,10 +58,10 @@ static void test_queue_floor_follows_a_new_trip() {
 	double t = 5000.0;
 	uint32_t lag = 0;
 	for (int i = 0; i < 300; i++, t += TICK) { // 5 s at a 40 ms trip
-		m.note((uint32_t)(t + 40), (int64_t)t);
+		m.note((int64_t)t, (uint32_t)(t + 40));
 	}
 	for (int i = 0; i < 600; i++, t += TICK) { // then 10 s at 90 ms: the old floor ages out
-		lag = m.note((uint32_t)(t + 90), (int64_t)t);
+		lag = m.note((int64_t)t, (uint32_t)(t + 90));
 	}
 	CHECK(lag <= 1);
 	printf("  the floor follows a lasting change of route: ok\n");
@@ -96,7 +96,7 @@ static void test_arrivals_pause_starts_over() {
 // Reports at 60 a second for ms; returns the rate at the end.
 static int feed_rate(RateAuto &c, uint32_t from, uint32_t ms, double lag, double delivered, double loss = 0.0) {
 	for (uint32_t t = from; t < from + ms; t += 16) {
-		c.note(t, lag, delivered, loss);
+		c.note(lag, delivered, loss, t);
 	}
 	return c.rate();
 }
@@ -167,7 +167,7 @@ static const double CEILING = 60.0;
 
 static double feed_cmd(CmdRateAuto &c, uint32_t from, uint32_t ms, double lag, double arriving = 0.0) {
 	for (uint32_t t = from; t < from + ms; t += 16) {
-		c.note(t, lag, arriving, CEILING);
+		c.note(lag, arriving, CEILING, t);
 	}
 	return c.rate();
 }
@@ -182,7 +182,7 @@ static bool near(double a, double b) { return std::fabs(a - b) < 0.01; }
 
 static void test_cmd_starts_low_and_climbs_quickly() {
 	CmdRateAuto c;
-	CHECK(c.note(1000, 0.0, 0.0, CEILING) == CmdRateAuto::START_HZ);
+	CHECK(c.note(0.0, 0.0, CEILING, 1000) == CmdRateAuto::START_HZ);
 	const int steps = (int)((CEILING - CmdRateAuto::START_HZ) / CmdRateAuto::STEP);
 	CHECK(feed_cmd(c, 1000, (steps + 1) * CmdRateAuto::SLOW_START_MS + 100, 5.0) == CEILING);
 	CHECK(feed_cmd(c, 20000, 20000, 5.0) == CEILING);
@@ -208,7 +208,7 @@ static void test_cmd_sustained_queueing_cuts_and_holds() {
 
 static void test_cmd_single_spike_does_not_cut() {
 	CmdRateAuto c = cmd_at_ceiling();
-	c.note(11000, 400.0, 0.0, CEILING);
+	c.note(400.0, 0.0, CEILING, 11000);
 	CHECK(feed_cmd(c, 11016, 2000, 5.0) == CEILING);
 	printf("  a single spike doesn't cut: ok\n");
 }
@@ -246,13 +246,13 @@ static void test_cmd_arrivals_above_the_rate_cut_from_the_rate() {
 
 static void test_downlink_samples_running_totals() {
 	DownlinkMeter d;
-	d.sample(1000, 50000, 100, 0); // the session so far: only a baseline
+	d.sample(50000, 100, 0, 1000); // the session so far: only a baseline
 	CHECK(d.delivered_bps() == 0.0);
-	d.sample(2000, 53000, 130, 10);
+	d.sample(53000, 130, 10, 2000);
 	CHECK(d.delivered_bps() == 3000.0);
-	d.sample(3000, 1000, 5, 0); // totals went down: a new session, so no rate from this one
+	d.sample(1000, 5, 0, 3000); // totals went down: a new session, so no rate from this one
 	CHECK(d.delivered_bps() == 3000.0);
-	d.sample(4000, 4000, 35, 0);
+	d.sample(4000, 35, 0, 4000);
 	CHECK(d.delivered_bps() == 3000.0);
 	printf("  delivered bytes come from running totals: ok\n");
 }
@@ -265,13 +265,13 @@ static void test_downlink_limits_a_queueing_link() {
 	int extra = 0;
 	for (; now < 1000 + RateAuto::WARMUP_MS + 3000; now += 33, server += 33) {
 		if (d.sample_due(now)) {
-			d.sample(now, bytes, 0, 0);
+			d.sample(bytes, 0, 0, now);
 		}
 		bytes += 100; // ~3000 B/s arriving
 		if (now > 1000 + RateAuto::WARMUP_MS - 2000) {
 			extra += 5; // and a queue building in front of it
 		}
-		d.note(now + extra, server);
+		d.note(server, now + extra);
 	}
 	CHECK(d.lag_ms() > 300);
 	CHECK(d.rate() > 0 && d.rate() <= 3100 * RateAuto::START);

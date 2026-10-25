@@ -7,11 +7,11 @@
 // P is whatever the host needs to replay a deferred send. The sim decides; the host sends:
 //
 //   if (sim.loss_percent() > 0 && droppable && sim.loss_roll()) return;  // simulated drop
-//   int d = sim.schedule(now_ms, link, bytes, droppable);
+//   int d = sim.schedule(link, bytes, droppable, now_ms);
 //   if (d < 0) return;                                                 // link queue full
-//   if (d == 0) send_now(...); else sim.enqueue(now_ms, link, d, payload);
+//   if (d == 0) send_now(...); else sim.enqueue(link, d, payload, now_ms);
 //   ...
-//   sim.pump(now_ms, [&](P &payload) { send_now(payload); });          // every poll
+//   sim.pump([&](P &payload) { send_now(payload); }, now_ms);          // every poll
 //
 // The bandwidth cap models a slow link (a modem, a BLE connection): sending over capacity doesn't
 // lose packets, it queues them, so delay grows until the link's buffer fills and only then do
@@ -135,7 +135,7 @@ public:
 	// is past queue_ms and the send is droppable. A send that can't be dropped (reliable) always
 	// queues, since the real transport would keep retransmitting it. Without a bandwidth cap this
 	// is just delay_ms().
-	int schedule(uint64_t p_now_ms, int32_t p_link, size_t p_bytes, bool p_droppable) {
+	int schedule(int32_t p_link, size_t p_bytes, bool p_droppable, uint64_t p_now_ms) {
 		if (bandwidth_bps_ <= 0) {
 			return delay_ms();
 		}
@@ -151,7 +151,7 @@ public:
 	}
 
 	// How far behind link p_link is, in ms: what a send made now would wait before transmitting.
-	double backlog_ms(uint64_t p_now_ms, int32_t p_link) const {
+	double backlog_ms(int32_t p_link, uint64_t p_now_ms) const {
 		auto it = link_free_at_.find(p_link);
 		if (it == link_free_at_.end() || it->second <= (double)p_now_ms) {
 			return 0.0;
@@ -169,7 +169,7 @@ public:
 	// pump() only releases the front of a link's queue, so a send never fires before one queued
 	// earlier on the same link — a short draw behind a long one waits for it. Links don't wait on
 	// each other.
-	void enqueue(uint64_t p_now_ms, int32_t p_link, int p_delay_ms, P p_payload) {
+	void enqueue(int32_t p_link, int p_delay_ms, P p_payload, uint64_t p_now_ms) {
 		queues_[p_link].push_back(Pending{ p_now_ms + (uint64_t)(p_delay_ms > 0 ? p_delay_ms : 0), std::move(p_payload) });
 	}
 
@@ -184,9 +184,10 @@ public:
 	// Call every poll: advances the spike machine by the real elapsed time, then hands every send
 	// whose time has come to p_fire, in queue order per link.
 	template <class F>
-	void pump(uint64_t p_now_ms, F &&p_fire) {
-		const float delta = last_pump_ms_ != 0 ? (float)(p_now_ms - last_pump_ms_) / 1000.0f : 0.0f;
+	void pump(F &&p_fire, uint64_t p_now_ms) {
+		const float delta = pumped_ ? (float)(p_now_ms - last_pump_ms_) / 1000.0f : 0.0f;
 		last_pump_ms_ = p_now_ms;
+		pumped_ = true;
 		update_spike(delta);
 		for (auto &kv : queues_) {
 			std::deque<Pending> &q = kv.second;
@@ -254,6 +255,7 @@ private:
 	float spike_timer_ = 0.0f;   // counts up to spike_interval_s while idle
 	float spike_elapsed_ = 0.0f; // counts up to spike_duration_s while active
 	uint64_t last_pump_ms_ = 0;
+	bool pumped_ = false;
 	std::unordered_map<int32_t, std::deque<Pending>> queues_;
 	int bandwidth_bps_ = BANDWIDTH_DEFAULT_BPS;
 	int queue_ms_ = QUEUE_DEFAULT_MS;

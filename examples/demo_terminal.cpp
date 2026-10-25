@@ -15,6 +15,7 @@
 #include "goldnet/netsim.h"
 #include "goldnet/server.h"
 #include "goldnet/uplink.h"
+#include "value_tags.h"
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -194,13 +195,13 @@ struct ServerApp : ServerHost<Value> {
 			return;
 		}
 		const uint32_t now = now_ms();
-		const int delay = sim.schedule(now, peer, o.bytes.size(), true);
+		const int delay = sim.schedule(peer, o.bytes.size(), true, now);
 		if (delay < 0) {
 			return;
 		} else if (delay == 0) {
 			transmit(o);
 		} else {
-			sim.enqueue(now, peer, delay, std::move(o));
+			sim.enqueue(peer, delay, std::move(o), now);
 		}
 	}
 
@@ -233,7 +234,6 @@ struct ServerApp : ServerHost<Value> {
 		spawn_order.push_back(id);
 
 		DemoServer::SpawnRecord rec;
-		rec.node_key = id;
 		rec.data = { (uint8_t)b.letter };
 		server.add_spawn(id, rec);
 		EntityLayout l;
@@ -317,7 +317,7 @@ struct ServerApp : ServerHost<Value> {
 		for (;;) {
 			uint32_t now = now_ms();
 			receive(now);
-			sim.pump(now, [&](Outgoing &o) { transmit(o); });
+			sim.pump([&](Outgoing &o) { transmit(o); }, now);
 
 			if ((int32_t)(now - next_tick) >= 0) {
 				simulate(TICK_MS / 1000.0f);
@@ -335,7 +335,7 @@ struct ServerApp : ServerHost<Value> {
 						drop_peer(id, "timed out");
 					}
 				}
-				server.tick(now, *this);
+				server.tick(*this, now);
 				next_tick += TICK_MS;
 			}
 
@@ -423,16 +423,16 @@ struct ClientApp : ClientHost<Value> {
 		}
 		Writer w;
 		w.put_u8('U');
-		client.write_uplink(now, w);
+		client.write_uplink(w, now);
 		if (sim.loss_roll()) {
 			return;
 		}
 		std::vector<uint8_t> pkt(w.data(), w.data() + w.size());
-		const int delay = sim.schedule(now, 0, pkt.size(), true);
+		const int delay = sim.schedule(0, pkt.size(), true, now);
 		if (delay == 0) {
 			transmit(pkt);
 		} else if (delay > 0) {
-			sim.enqueue(now, 0, delay, std::move(pkt));
+			sim.enqueue(0, delay, std::move(pkt), now);
 		}
 	}
 
@@ -528,12 +528,12 @@ struct ClientApp : ClientHost<Value> {
 				last_heard = now_ms();
 				snapshots++;
 				bytes_in += (size_t)n;
-				if (client.apply(buf, (size_t)n, *this, now_ms()).committed) {
+				if (client.apply(buf, (size_t)n, *this, now_ms())) {
 					committed++;
 				}
 			}
 			const uint32_t now = now_ms();
-			sim.pump(now, [&](std::vector<uint8_t> &pkt) { transmit(pkt); });
+			sim.pump([&](std::vector<uint8_t> &pkt) { transmit(pkt); }, now);
 			if (last_heard != 0 && (int32_t)(now - next_cmd) >= 0) {
 				make_command(now);
 				next_cmd += CMD_MS;

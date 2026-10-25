@@ -126,7 +126,7 @@ type and its hint (`gn_quant`, `gn_grid`), so a value carries no tag:
 `kinds_check` is a hash of the kinds and grids. A slot whose property is untyped or of another type
 goes as a tagged value, which needs no hint to decode:
 
-A tagged value is a 1-byte tag followed by its payload. Which lossy tag to use is the sender's choice
+A tagged value is a 1-byte tag (goldnet-godot's `ValueTag`) followed by its payload. Which lossy tag to use is the sender's choice
 (in Godot, the `gn_quant` meta).
 
 | Tag | Name         | Payload | Decodes to |

@@ -318,7 +318,7 @@ static void test_uplink_order() {
 	s.queue_reliable(r.data(), r.size());
 	CHECK(s.due(10));
 	Writer w;
-	s.write(10, 0, ChannelAckSource(), w);
+	s.write(w, 0, ChannelAckSource(), 10);
 	CommandReceiver recv;
 	UpHost h;
 	CHECK(recv.receive(2, w.data(), w.size(), h, 10));

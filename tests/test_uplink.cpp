@@ -65,7 +65,7 @@ struct Link {
 			return;
 		}
 		Writer w;
-		sender.write(now, 0, ChannelAckSource(), w);
+		sender.write(w, 0, ChannelAckSource(), now);
 		const int n = packets_up++;
 		bytes_up += w.size();
 		if (roll(up_loss) || drop_next.count(n)) {
@@ -204,7 +204,7 @@ static void test_repeated_bytes_cost_their_changes() {
 	s.push(1, a.data(), a.size(), 10);
 	s.push(1, b.data(), b.size(), 10);
 	Writer w;
-	s.write(10, 0, ChannelAckSource(), w);
+	s.write(w, 0, ChannelAckSource(), 10);
 	// Header 24 (incl. the send time, zero rates, an empty channel part, one stream and first_seq),
 	// then the first command against zeros: field mask 1, len 1, byte mask 4, 32 bytes. Then an
 	// identical one: gap 1, field mask 1. Then one changed byte: gap, field mask, len, byte mask, 1.
@@ -234,7 +234,7 @@ static void test_typed_fields_cost_their_changes() {
 	s.push(1, typed_cmd(5002, -290, 0.5f, false), 10);
 	s.push(1, typed_cmd(5003, -290, -0.0f, false), 10);
 	Writer w;
-	s.write(10, 0, ChannelAckSource(), w);
+	s.write(w, 0, ChannelAckSource(), 10);
 	// The first against zeros: mask 1, 5000 zig-zagged 2, -300 zig-zagged 2, f32 4, the bool's bit 0.
 	// Then each: gap 1 and mask 1, plus a +1 step 1; +1 and a +10 turn 1 each with the flip free;
 	// +1 and -0.0, which differs bitwise from 0.5 and travels whole, 4.
@@ -262,7 +262,7 @@ static void test_unknown_schema_drops_commands_not_packet() {
 	c[0].i = 7;
 	s.push(1, c, 10);
 	Writer w;
-	s.write(10, 321, ChannelAckSource(), w);
+	s.write(w, 321, ChannelAckSource(), 10);
 	CommandReceiver r;
 	struct Host : RecvHost {
 		const Schema *command_schema(int32_t, uint32_t) { return nullptr; }
@@ -276,7 +276,7 @@ static void test_unknown_schema_drops_commands_not_packet() {
 static void test_snapshot_ack_rides_along() {
 	CommandSender s;
 	Writer w;
-	s.write(10, 321, ChannelAckSource(), w); // nothing to send but the ack
+	s.write(w, 321, ChannelAckSource(), 10); // nothing to send but the ack
 	CommandReceiver r;
 	RecvHost h;
 	CHECK(r.receive(2, w.data(), w.size(), h, 0));
@@ -291,7 +291,7 @@ static void test_malformed_input() {
 	s.push(1, b.data(), b.size(), 10);
 	s.push(1, b.data(), b.size(), 10);
 	Writer w;
-	s.write(10, 5, ChannelAckSource(), w);
+	s.write(w, 5, ChannelAckSource(), 10);
 	CommandReceiver r;
 	RecvHost h;
 	for (size_t cut = 0; cut < w.size(); cut++) {
@@ -320,7 +320,7 @@ static void test_rtt_is_measured_through_backups() {
 		std::vector<uint8_t> b = cmd_bytes(i);
 		s.push(1, b.data(), b.size(), now);
 		Writer w;
-		s.write(now, 0, ChannelAckSource(), w);
+		s.write(w, 0, ChannelAckSource(), now);
 		in_flight.emplace_back(w.data(), w.data() + w.size());
 		if (in_flight.size() > 5) {
 			CHECK(r.receive(2, in_flight.front().data(), in_flight.front().size(), h, 0));
@@ -347,7 +347,7 @@ static void test_rtt_is_learned_past_the_first_overdue() {
 		std::vector<uint8_t> b = cmd_bytes(i);
 		s.push(1, b.data(), b.size(), now);
 		Writer w;
-		s.write(now, 0, ChannelAckSource(), w);
+		s.write(w, 0, ChannelAckSource(), now);
 		if (i >= 150) {
 			late_cmds += w.data()[21]; // cmd_ct, after the send time, zero rates, an empty channel part and one stream id
 		}
@@ -381,7 +381,7 @@ static void test_rtt_longer_than_the_ring_is_learned() {
 		std::vector<uint8_t> b = cmd_bytes(i);
 		s.push(1, b.data(), b.size(), now);
 		Writer w;
-		s.write(now, 0, ChannelAckSource(), w);
+		s.write(w, 0, ChannelAckSource(), now);
 		if (i >= 350) {
 			late_cmds += w.data()[21]; // cmd_ct, after the send time, zero rates, an empty channel part and one stream id
 		}
@@ -424,7 +424,7 @@ static void test_proven_lost_command_goes_at_once() {
 	uint32_t now = 1000;
 	auto send = [&](bool deliver) {
 		Writer w;
-		s.write(now, 0, ChannelAckSource(), w);
+		s.write(w, 0, ChannelAckSource(), now);
 		if (deliver) {
 			CHECK(r.receive(2, w.data(), w.size(), h, now));
 		}
@@ -455,7 +455,7 @@ static void test_a_repeat_earns_the_ack_again() {
 	std::vector<uint8_t> a = cmd_bytes(0);
 	s.push(1, a.data(), a.size(), 10);
 	Writer w;
-	s.write(10, 0, ChannelAckSource(), w);
+	s.write(w, 0, ChannelAckSource(), 10);
 	CHECK(r.receive(2, w.data(), w.size(), h, 10));
 	CHECK(!r.take_news(2)); // delivered, and the ack moved: the ack itself is the news
 	CHECK(r.receive(2, w.data(), w.size(), h, 20)); // the same packet again
@@ -465,7 +465,7 @@ static void test_a_repeat_earns_the_ack_again() {
 	s.on_ack(r.ack(2));
 	s.push(1, b.data(), b.size(), 30);
 	Writer w2;
-	s.write(30, 0, ChannelAckSource(), w2); // a new command, with the old one riding as a backup
+	s.write(w2, 0, ChannelAckSource(), 30); // a new command, with the old one riding as a backup
 	CHECK(r.receive(2, w2.data(), w2.size(), h, 30));
 	CHECK(!r.take_news(2)); // routine backups are no reason to send
 	CHECK(h.got.size() == 2);
@@ -478,18 +478,18 @@ static void test_rate_rides_along() {
 	CommandReceiver r;
 	RecvHost h;
 	Writer w;
-	s.write(10, 0, ChannelAckSource(), w);
+	s.write(w, 0, ChannelAckSource(), 10);
 	CHECK(r.receive(2, w.data(), w.size(), h, 10));
 	CHECK(r.rate(2) == 0);
 	s.set_rate(2750);
 	Writer w2;
-	s.write(26, 0, ChannelAckSource(), w2);
+	s.write(w2, 0, ChannelAckSource(), 26);
 	CHECK(r.receive(2, w2.data(), w2.size(), h, 26));
 	CHECK(r.rate(2) == 2800);
 	CHECK(r.update_rate(2) == 0);
 	s.set_update_rate(20);
 	Writer w3;
-	s.write(42, 0, ChannelAckSource(), w3);
+	s.write(w3, 0, ChannelAckSource(), 42);
 	CHECK(r.receive(2, w3.data(), w3.size(), h, 42));
 	CHECK(r.update_rate(2) == 20);
 	printf("  the rate and update rate ride every packet: ok\n");
@@ -504,14 +504,14 @@ static void test_uplink_lag_is_metered_across_the_wrap() {
 	uint32_t now = 65536 - 500; // the client's clock wraps 16 bits half a second in
 	for (int i = 0; i < 120; i++, now += 16) {
 		Writer w;
-		s.write(now, 0, ChannelAckSource(), w);
+		s.write(w, 0, ChannelAckSource(), now);
 		CHECK(r.receive(2, w.data(), w.size(), h, now + 1000040)); // another clock, a 40 ms trip
 	}
 	CHECK(r.uplink_lag_ms(2) <= 1);
 	CHECK(r.uplink_pps(2) >= 60 && r.uplink_pps(2) <= 64);
 	for (int k = 0; k < 60; k++, now += 16) {
 		Writer w;
-		s.write(now, 0, ChannelAckSource(), w);
+		s.write(w, 0, ChannelAckSource(), now);
 		CHECK(r.receive(2, w.data(), w.size(), h, now + 1000040 + 5 * k));
 	}
 	CHECK(r.uplink_lag_ms(2) >= 290 && r.uplink_lag_ms(2) <= 300);

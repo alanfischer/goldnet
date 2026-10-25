@@ -75,6 +75,9 @@ The byte-level wire format is in [`docs/protocol.md`](docs/protocol.md).
 Add `include/` to your include path, or `add_subdirectory(goldnet)` and link the `goldnet`
 target. Tests and examples only build when goldnet is the top-level project.
 
+Every call that takes the clock takes it last: ms from any clock that counts up, starting wherever it
+likes (0 included). A `Writer` to fill comes first, and a host or callback just before the clock.
+
 Server:
 
 ```cpp
@@ -87,7 +90,7 @@ server.add_spawn(net_id, record);   // a runtime entity clients must create; des
 server.mark_dirty(key);             // a pushed slot was written (EntityLayout::push)
 
 server.add_peer(peer);              // on connect; remove_peer(peer) on disconnect
-server.tick(now_ms, host);          // every tick: reads state, sends each due peer a snapshot
+server.tick(host, now_ms);          // every tick: reads state, sends each due peer a snapshot
 server.peer_stats(peer);            // its rate, chokes, uplink report and netchan counts
 
 server.set_command_schema(stream_id, schema);  // a command stream's fields, as the client names them
@@ -118,7 +121,7 @@ client.push_command(stream_id, bytes, size, now_ms);  // one command; returns it
 client.set_rate(25000);           // what to ask the server for; or set_auto_rate(true)
 if (client.uplink_due(now_ms)) {  // commands, messages, or an ack the server is waiting on
     goldnet::Writer w;
-    client.write_uplink(now_ms, w);  // send w to the server
+    client.write_uplink(w, now_ms);  // send w to the server
 }
 client.stats();                   // arrivals, lag, the rates in force, commands and messages
 ```

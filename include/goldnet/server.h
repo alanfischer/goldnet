@@ -160,12 +160,10 @@ public:
 
 	// A runtime entity's creation record, replayed to each peer the first time the entity is
 	// visible to it. spawner_net_id names what creates it on the client (0 = none) and goes on the
-	// wire with data, which is opaque to the protocol. node_key is the host's own; the server never
-	// reads it. vis_keys are the keys to ask spawn_visible() about, and the entities beyond the one
-	// at the spawn's net_id that the spawn creates.
+	// wire with data, which is opaque to the protocol. vis_keys are the keys to ask spawn_visible()
+	// about, and the entities beyond the one at the spawn's net_id that the spawn creates.
 	struct SpawnRecord {
 		uint32_t spawner_net_id = 0;
-		uint64_t node_key = 0;
 		std::vector<uint8_t> data;
 		// Empty ⇒ no visibility info ⇒ send to everyone (fail open).
 		std::vector<uint64_t> vis_keys;
@@ -372,7 +370,7 @@ public:
 	// choked: it gets no snapshot this tick, and the next one it does get deltas against its acked
 	// baseline, so it carries the latest state rather than a backlog. A slow link then gets fewer
 	// snapshots instead of a queue that delays every one of them. A no-op for an unrated peer.
-	void charge(int32_t p_peer, uint32_t p_now, size_t p_bytes) {
+	void charge(int32_t p_peer, size_t p_bytes, uint32_t p_now) {
 		auto it = rings_.find(p_peer);
 		if (it == rings_.end() || it->second.rate_bps == 0) {
 			return;
@@ -420,7 +418,7 @@ public:
 
 	// Build and send this tick's snapshot to every peer that is due one.
 	template <class Host>
-	void tick(uint32_t p_now, Host &p_host);
+	void tick(Host &p_host, uint32_t p_now);
 
 private:
 	// A stepped slot's value as of counter p_ctr, or null if that has left its history.
@@ -538,9 +536,11 @@ private:
 		// When this peer was last considered for a send, for the cadence check. Advances even on a
 		// tick that decides to send nothing.
 		uint32_t last_sent_ms = 0;
+		bool considered = false; // last_sent_ms is set
 		// When a snapshot was last actually EMITTED to this peer. Gates the clock keepalive, which
 		// has to know how long the peer has really been without a header.
 		uint32_t last_packet_ms = 0;
+		bool sent = false; // last_packet_ms is set
 		// Priority-ordered overflow. net_id -> the snapshot counter this entity FIRST had an unsent
 		// pending change for THIS peer; cleared once it's actually written. The wait, weighted by
 		// EntityLayout::priority, scores entities when more changed this tick than fit in the budget — the
@@ -656,10 +656,10 @@ Result Server<V, X>::receive_uplink(int32_t p_peer, const uint8_t *p_data, size_
 
 template <class V, class X>
 template <class Host>
-void Server<V, X>::tick(uint32_t p_now, Host &p_host) {
+void Server<V, X>::tick(Host &p_host, uint32_t p_now) {
 	// Resolve which peers are due BEFORE the per-entity state read below: on a tick where every
 	// peer is throttled (all of them on a slower cadence than the server's) this costs nothing.
-	// last_sent_ms == 0 always sends — a peer's first snapshot must not wait out an interval.
+	// A peer never considered always sends — its first snapshot must not wait out an interval.
 	// A slower peer is due half a tick early, so clock jitter can't push it a whole tick late.
 	const double slack_ms = snapshot_rate_ > 0.0 ? 500.0 / snapshot_rate_ : 0.0;
 	std::vector<int32_t> due;
@@ -668,7 +668,7 @@ void Server<V, X>::tick(uint32_t p_now, Host &p_host) {
 		const double hz = grant(pr);
 		pr.update_rate = (uint32_t)std::lround(hz);
 		const bool gated = hz > 0.0 && !(snapshot_rate_ > 0.0 && hz >= snapshot_rate_);
-		if (gated && pr.last_sent_ms != 0 && (double)(p_now - pr.last_sent_ms) + slack_ms < 1000.0 / hz) {
+		if (gated && pr.considered && (double)(p_now - pr.last_sent_ms) + slack_ms < 1000.0 / hz) {
 			continue;
 		}
 		if (pr.rate_bps > 0 && pr.clear_at_ms > (double)p_now) {
@@ -709,6 +709,7 @@ void Server<V, X>::tick(uint32_t p_now, Host &p_host) {
 	for (int32_t peer : due) {
 		PeerRing &pr = rings_[peer];
 		pr.last_sent_ms = p_now;
+		pr.considered = true;
 
 		// Baseline = the frame this peer last acked, if we still hold it. Otherwise send a full
 		// frame (baseline seq 0) — first send, or an ack aged out of the ring under heavy loss.
@@ -951,17 +952,18 @@ void Server<V, X>::tick(uint32_t p_now, Host &p_host) {
 
 		// Nothing to report: skip the header-only packet — except that the header carries
 		// server_time, the client's only clock feed, so "nothing to report" only earns a skip while
-		// that feed is still fresh. last_packet_ms == 0 is a peer never sent anything — its first
-		// snapshot must go out regardless, or the clock never starts. Nothing above recorded `seq`
+		// that feed is still fresh. A peer's first snapshot goes out regardless, or the clock never
+		// starts. Nothing above recorded `seq`
 		// unless something went in the packet, so the next snapshot reuses it.
 		// A command ack the peer hasn't been told is news too: it is what stops the peer resending.
 		if (spawn_ct == 0 && despawn_ct == 0 && leave_ct == 0 && changed == 0 && pr.cmd_ack == pr.cmd_ack_sent && !pr.cmd_news
 				&& block_flags == 0 && datagram.empty() && up.bit == pr.uplink_sent.bit
 				&& (!up.fragments || up.next_fragment == pr.uplink_sent.next_fragment)
-				&& pr.last_packet_ms != 0 && p_now - pr.last_packet_ms < CLOCK_KEEPALIVE_MS) {
+				&& pr.sent && p_now - pr.last_packet_ms < CLOCK_KEEPALIVE_MS) {
 			continue;
 		}
 		pr.last_packet_ms = p_now;
+		pr.sent = true;
 		pr.cmd_ack_sent = pr.cmd_ack;
 		pr.cmd_news = false;
 		pr.uplink_sent = up;
@@ -995,7 +997,7 @@ void Server<V, X>::tick(uint32_t p_now, Host &p_host) {
 		packet.put_u16(changed);
 		packet.put_data(body);
 		p_host.send(peer, packet);
-		charge(peer, p_now, packet.size() + (size_t)packet_overhead_);
+		charge(peer, packet.size() + (size_t)packet_overhead_, p_now);
 	}
 }
 

@@ -364,11 +364,11 @@ struct ClientCore : goldnet::ClientHost<Value> {
 			return;
 		}
 		const uint32_t now = now_ms();
-		const int delay = s.schedule(now, 0, pkt.size(), true);
+		const int delay = s.schedule(0, pkt.size(), true, now);
 		if (delay == 0) {
 			now_fn(pkt);
 		} else if (delay > 0) {
-			s.enqueue(now, 0, delay, std::move(pkt));
+			s.enqueue(0, delay, std::move(pkt), now);
 		}
 	}
 
@@ -385,7 +385,7 @@ struct ClientCore : goldnet::ClientHost<Value> {
 		if (info.command_ack != 0) {
 			acked = info.command_ack;
 		}
-		if (fresh && info.committed) {
+		if (fresh && info) {
 			on_snapshot();
 		}
 	}
@@ -401,8 +401,8 @@ struct ClientCore : goldnet::ClientHost<Value> {
 			through(down_sim, std::move(buf), [&](std::vector<uint8_t> &p) { handle_snapshot(p); });
 		}
 		const uint32_t now = now_ms();
-		down_sim.pump(now, [&](std::vector<uint8_t> &p) { handle_snapshot(p); });
-		up_sim.pump(now, [&](std::vector<uint8_t> &p) { transmit(p); });
+		down_sim.pump([&](std::vector<uint8_t> &p) { handle_snapshot(p); }, now);
+		up_sim.pump([&](std::vector<uint8_t> &p) { transmit(p); }, now);
 		if (!connected && (int32_t)(now - next_hello) >= 0) {
 			new_session(); // no server yet: keep knocking
 			next_hello = now + 500;
@@ -537,7 +537,7 @@ struct ClientCore : goldnet::ClientHost<Value> {
 		if (connected && client.uplink_due(now)) {
 			Writer w;
 			w.put_u8('U');
-			client.write_uplink(now, w);
+			client.write_uplink(w, now);
 			through(up_sim, std::vector<uint8_t>(w.data(), w.data() + w.size()),
 					[&](std::vector<uint8_t> &p) { transmit(p); });
 		}
