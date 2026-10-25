@@ -1,4 +1,4 @@
-# goldnet wire protocol (version 10)
+# goldnet wire protocol (version 11)
 
 The byte-level contract between goldnet's two ends: what a snapshot and an uplink packet contain,
 how each value is encoded, and what each end does with them. The README's **How it
@@ -56,7 +56,7 @@ the datagram. A message is `uvarint target` and then:
 One per peer per send, server to client.
 
 ```
-u8   version        WIRE_VERSION = 10
+u8   version        WIRE_VERSION = 11
 u16  seq            this frame's number for this peer
 u16  base_seq       the frame this one is a delta against; 0 = full state
 u32  server_time    the server's clock at send, ms
@@ -66,8 +66,8 @@ uvarint uplink_pps  this peer's uplink packets arriving per second; 0 = not know
 uvarint update_rate the snapshots/sec this peer is granted, rounded (see **Sending**); 0 = every tick, at a rate the server doesn't know
 ...  channel part   (see **Channel**) its ack is the newest uplink packet received
 u16  spawn_ct       then spawn_ct  × spawn entry
-u16  despawn_ct     then despawn_ct × u32 net_id
-u16  leave_ct       then leave_ct   × u32 net_id
+u16  despawn_ct     then despawn_ct × uvarint net_id
+u16  leave_ct       then leave_ct   × uvarint net_id
 u16  changed_ct     then changed_ct × entity entry
 ```
 
@@ -78,20 +78,27 @@ channel part and the four counts) is `SNAPSHOT_HEADER_BYTES` = 32.
 **Spawn entry** — a runtime entity the client must create before any delta can reach it:
 
 ```
-u32  net_id           the new entity
-u32  spawner_net_id   the spawner that creates it; 0 if none
-u32  len
-len bytes             spawn data, opaque to the protocol (Godot: var_to_bytes of the spawn's data)
+uvarint net_id           the new entity
+uvarint spawner_net_id   the spawner that creates it; 0 if none
+uvarint len
+len bytes             spawn data, opaque to the protocol
 ```
 
-**Despawn** and **leave** entries are a bare `u32 net_id`. A despawn destroys the entity; a leave
+goldnet-godot hands out its net_ids on the server, from 1, and tells clients what they name with
+spawn entries. One with a spawner is a spawn: its data is `uvarint n`, then for each of the
+synchronizers the spawned node brings its `uvarint net_id` and its path from the node (`uvarint`
+length, UTF-8), then `var_to_bytes` of the spawn's data. One with spawner 0 is a *bind*: its data is the UTF-8 path of a
+node both ends already have (a synchronizer or a spawner placed in the scene), which the client
+binds to the net_id; its despawn unbinds it.
+
+**Despawn** and **leave** entries are a bare `uvarint net_id`. A despawn destroys the entity; a leave
 (sent unless the server turns relevance events off) says it dropped out of the peer's PVS. At most
 `MAX_LEAVES_PER_SNAPSHOT` = 32 leaves ride one snapshot.
 
 **Entity entry** — the slots of one entity that changed since `base_seq`:
 
 ```
-u32      net_id
+uvarint  net_id
 uvarint  mask                bit s set = slot s follows
 uvarint  len << 1 | whole    then, after kinds_check, len bytes: each changed slot, ascending
 u8       kinds_check         only when whole: the server host's summary of how it codes the slots
@@ -107,6 +114,9 @@ back by the cap, at whatever values it last had), or when a changed stepped slot
 baseline has left the server's history of it (`SLOT_HISTORY` = 64 changes). A slot with no change
 recorded before the baseline is still at its starting value, the host's default. The length lets a receiver step over an entity it doesn't know, or one whose
 `kinds_check` doesn't match its own host's.
+
+Every net_id goes as a `uvarint`, so a host that numbers its entities from small integers pays a
+byte for one under 128 and two under 16384, where a 32-bit hash pays five.
 
 ## Values
 

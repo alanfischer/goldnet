@@ -562,9 +562,9 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	// What holds the ack, if anything does: the spawns refused, and the entities that set defer_ack below.
 	std::vector<uint32_t> holding;
 	for (int i = 0; i < spawn_ct && !r.failed(); i++) {
-		const uint32_t nid = r.get_u32();
-		const uint32_t spawner_nid = r.get_u32();
-		const uint32_t len = r.get_u32();
+		const uint32_t nid = get_uvarint(&r);
+		const uint32_t spawner_nid = get_uvarint(&r);
+		const uint32_t len = get_uvarint(&r);
 		const uint8_t *data = r.get_data(len);
 		if (data && !spawned_.count(nid)) {
 			if (p_host.spawn(nid, spawner_nid, data, len)) {
@@ -580,14 +580,14 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	const int despawn_ct = r.get_u16();
 	std::vector<uint32_t> despawns;
 	for (int i = 0; i < despawn_ct && !r.failed(); i++) {
-		despawns.push_back(r.get_u32());
+		despawns.push_back(get_uvarint(&r));
 	}
 	info.despawns = despawn_ct;
 	// Relevance leaves: collect now (wire order), apply after the entity deltas.
 	const int leave_ct = r.get_u16();
 	std::vector<uint32_t> leaves;
 	for (int i = 0; i < leave_ct && !r.failed(); i++) {
-		leaves.push_back(r.get_u32());
+		leaves.push_back(get_uvarint(&r));
 	}
 
 	const int count = r.get_u16();
@@ -609,7 +609,7 @@ typename Client<V>::ApplyInfo Client<V>::apply(const uint8_t *p_data, size_t p_s
 	bool defer_ack = false;
 
 	for (int i = 0; i < count && !r.failed(); i++) {
-		const uint32_t net_id = r.get_u32();
+		const uint32_t net_id = get_uvarint(&r);
 		const uint32_t mask = get_uvarint(&r);
 		const uint32_t len_whole = get_uvarint(&r);
 		const uint32_t len = len_whole >> 1;
