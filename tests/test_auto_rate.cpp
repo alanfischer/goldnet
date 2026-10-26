@@ -108,6 +108,9 @@ static RateAuto warm_rate() {
 	return c;
 }
 
+// Long enough at 300 ms of lag to read as a queue: it crosses HIGH_MS within a few reports.
+static const uint32_t QUEUEING = RateAuto::QUEUE_MS + 100;
+
 static void test_rate_join_burst_is_not_judged() {
 	RateAuto c;
 	CHECK(feed_rate(c, 0, RateAuto::WARMUP_MS - 100, 500.0, 3000.0) == 0);
@@ -120,26 +123,33 @@ static void test_rate_no_limit_while_it_keeps_up() {
 	printf("  no limit while the downlink keeps up: ok\n");
 }
 
+static void test_rate_lag_shorter_than_a_queue_sets_no_limit() {
+	RateAuto c = warm_rate();
+	CHECK(feed_rate(c, 6000, RateAuto::QUEUE_MS / 2, 300.0, 6000.0) == 0);
+	CHECK(feed_rate(c, 6000 + RateAuto::QUEUE_MS / 2, 10000, 5.0, 6000.0) == 0);
+	printf("  lag that doesn't last sets no limit: ok\n");
+}
+
 static void test_rate_first_limit_is_under_what_arrives() {
 	RateAuto c = warm_rate();
-	CHECK(feed_rate(c, 6000, 1000, 300.0, 6000.0) == (int)(6000.0 * RateAuto::START));
+	CHECK(feed_rate(c, 6000, QUEUEING, 300.0, 6000.0) == (int)(6000.0 * RateAuto::START));
 	printf("  the first limit is just under what arrives: ok\n");
 }
 
 static void test_rate_cuts_while_queueing_down_to_the_floor() {
 	RateAuto c = warm_rate();
-	const int first = feed_rate(c, 6000, 1000, 300.0, 6000.0);
-	CHECK(feed_rate(c, 7000, 1000, 300.0, 6000.0) == first); // held while the queue drains
-	CHECK(feed_rate(c, 8000, 2000, 300.0, 6000.0) < first);
-	CHECK(feed_rate(c, 10000, 60000, 300.0, 6000.0) == MIN_RATE);
+	const int first = feed_rate(c, 6000, QUEUEING, 300.0, 6000.0); // cuts ~7025, held to ~9025
+	CHECK(feed_rate(c, 7100, 1000, 300.0, 6000.0) == first); // held while the queue drains
+	CHECK(feed_rate(c, 8100, 2000, 300.0, 6000.0) < first);  // still queueing as the hold ends
+	CHECK(feed_rate(c, 10100, 60000, 300.0, 6000.0) == MIN_RATE);
 	printf("  cuts while it queues, never under the floor: ok\n");
 }
 
 static void test_rate_climbs_while_calm_up_to_the_ceiling() {
 	RateAuto c = warm_rate();
-	const int limited = feed_rate(c, 6000, 1000, 300.0, 6000.0);
-	// Calm is counted from the cut (~6050), so the first climb lands ~9050 and the next ~12050.
-	const int r = feed_rate(c, 7000, RateAuto::CALM_MS + 1100, 5.0, 3000.0);
+	const int limited = feed_rate(c, 6000, QUEUEING, 300.0, 6000.0);
+	// Calm is counted from the cut (~7025), so the first climb lands ~10025 and the next ~13025.
+	const int r = feed_rate(c, 7100, RateAuto::CALM_MS + 1100, 5.0, 3000.0);
 	CHECK(r > limited && r <= (int)(limited * RateAuto::CLIMB) + 1);
 	CHECK(feed_rate(c, 15000, 600000, 5.0, 3000.0) == RateAuto::MAX_RATE);
 	printf("  climbs a step per calm spell, up to the ceiling: ok\n");
@@ -156,8 +166,8 @@ static void test_rate_overflow_without_lag_still_limits() {
 // Once limited, missing snapshots may be the limit's own chokes: not a reason to cut further.
 static void test_rate_choke_loss_is_not_congestion() {
 	RateAuto c = warm_rate();
-	const int limited = feed_rate(c, 6000, 1000, 300.0, 6000.0);
-	CHECK(feed_rate(c, 7000, RateAuto::CALM_MS + 1100, 5.0, 3000.0, 0.7) > limited);
+	const int limited = feed_rate(c, 6000, QUEUEING, 300.0, 6000.0);
+	CHECK(feed_rate(c, 7100, RateAuto::CALM_MS + 1100, 5.0, 3000.0, 0.7) > limited);
 	printf("  a limited client's chokes are not congestion: ok\n");
 }
 
@@ -278,6 +288,38 @@ static void test_downlink_limits_a_queueing_link() {
 	printf("  a queueing downlink gets a limit under what arrives (%d B/s): ok\n", d.rate());
 }
 
+// A client frame stall: snapshots wait in the socket and are all read when it polls again, so they
+// arrive late together. A burst held up on the link looks the same. Either clears within a few
+// frames; neither is a queue, and neither may set a limit.
+static void test_downlink_stall_is_not_a_queue() {
+	for (const uint32_t stall : { 150u, 300u, 450u }) {
+		DownlinkMeter d;
+		uint32_t server = 900000;
+		uint64_t bytes = 0;
+		auto deliver = [&](uint32_t p_at) {
+			if (d.sample_due(p_at)) {
+				d.sample(bytes, 0, 0, p_at);
+			}
+			bytes += 60;
+			d.note(server, p_at);
+			server += 16;
+		};
+		uint32_t now = 1000;
+		for (; now < 1000 + RateAuto::WARMUP_MS + 2000; now += 16) {
+			deliver(now);
+		}
+		const uint32_t resume = now + stall;
+		for (; now < resume; now += 16) {
+			deliver(resume);
+		}
+		for (; now < resume + 10000; now += 16) {
+			deliver(now);
+		}
+		CHECK(d.rate() == 0);
+	}
+	printf("  a stall or a late burst sets no limit: ok\n");
+}
+
 int main() {
 	printf("auto_rate:\n");
 	test_queue_steady_stream_reads_no_lag();
@@ -288,6 +330,7 @@ int main() {
 	test_arrivals_pause_starts_over();
 	test_rate_join_burst_is_not_judged();
 	test_rate_no_limit_while_it_keeps_up();
+	test_rate_lag_shorter_than_a_queue_sets_no_limit();
 	test_rate_first_limit_is_under_what_arrives();
 	test_rate_cuts_while_queueing_down_to_the_floor();
 	test_rate_climbs_while_calm_up_to_the_ceiling();
@@ -302,6 +345,7 @@ int main() {
 	test_cmd_arrivals_above_the_rate_cut_from_the_rate();
 	test_downlink_samples_running_totals();
 	test_downlink_limits_a_queueing_link();
+	test_downlink_stall_is_not_a_queue();
 	printf("auto_rate: %d checks passed\n", checks);
 	return 0;
 }
