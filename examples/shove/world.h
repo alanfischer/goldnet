@@ -215,10 +215,11 @@ inline SolidPtr make_player_body() {
 
 inline SolidPtr make_block_body() {
 	auto s = std::make_shared<Solid>();
-	s->set_mass(1.0f);
+	const float m = 5.0f;
+	s->set_mass(m);
 	s->set_scope(U_BLOCK);
 	s->set_contact_mode(hop::contact_mode::speculative);
-	const float i = (2.0f * BLOCK_HALF) * (2.0f * BLOCK_HALF) / 6.0f; // m s² / 6
+	const float i = m * (2.0f * BLOCK_HALF) * (2.0f * BLOCK_HALF) / 6.0f; // m s² / 6
 	s->set_inertia(vec3(i, i, i));
 	s->set_coefficient_of_restitution(0.2f);
 	s->set_coefficient_of_static_friction(1.2f); // 0.6 against the arena
