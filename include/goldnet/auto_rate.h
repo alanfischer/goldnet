@@ -99,6 +99,9 @@ private:
 // is just under what is actually arriving, since a full link's delivery rate is its capacity; from
 // there, a sharp cut while it still queues and a slow climb while it doesn't, up to MAX_RATE.
 //
+// Lag counts only once it lasts: a client frame stall, or a burst held up on the link, makes snapshots
+// arrive late together, but clears within a few frames, while a queue keeps them late.
+//
 // Lag alone can't see a queue that was full from the very first snapshot (the join's burst can do
 // that): with no uncongested moment to measure from, the full queue IS the floor. A full buffer drops
 // what it can't hold, though, so while there's no limit, snapshots going missing counts as queueing
@@ -109,6 +112,7 @@ public:
 	// can hold the smoothed lag at a few tens of ms with no queue at all.
 	static constexpr double HIGH_MS = 80.0;     // smoothed lag over this: the downlink is queueing
 	static constexpr double LOW_MS = 40.0;      // under this for CALM_MS: room for more
+	static constexpr uint32_t QUEUE_MS = 1000;  // over HIGH_MS this long: a queue, not a stall or a burst
 	static constexpr uint32_t WARMUP_MS = 5000; // the join's burst queues on any link; judge only after it
 	static constexpr uint32_t CALM_MS = 3000;
 	static constexpr uint32_t HOLD_MS = 2000;   // after a cut, let the queue drain before judging again
@@ -127,14 +131,18 @@ public:
 			started_ = true;
 			started_ms_ = p_now;
 		}
-		if (p_now - started_ms_ < WARMUP_MS) {
+		const bool warming = p_now - started_ms_ < WARMUP_MS;
+		if (warming || smoothed_ <= HIGH_MS) {
+			high_since_ = p_now;
+		}
+		if (warming) {
 			calm_since_ = p_now;
 			return rate_;
 		}
 		if ((int32_t)(p_now - hold_until_) < 0) {
 			return rate_;
 		}
-		if (smoothed_ > HIGH_MS || (rate_ == 0 && p_loss > LOSS_HIGH)) {
+		if (p_now - high_since_ >= QUEUE_MS || (rate_ == 0 && p_loss > LOSS_HIGH)) {
 			const int cut = rate_ == 0 ? (int)(p_delivered_bps * START) : (int)(rate_ * CUT);
 			rate_ = std::max((int)MIN_RATE, cut);
 			hold_until_ = p_now + HOLD_MS;
@@ -157,6 +165,7 @@ private:
 	double smoothed_ = 0.0;
 	uint32_t hold_until_ = 0;
 	uint32_t calm_since_ = 0;
+	uint32_t high_since_ = 0; // the last report not judged over HIGH_MS
 	uint32_t started_ms_ = 0;
 	bool started_ = false;
 };
